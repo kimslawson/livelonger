@@ -1,0 +1,10 @@
+# your data: private entries live here — never commit it
+archive/
+site/
+site-public/
+livelonger.toml
+*.cookies
+cookies.txt
+__pycache__/
+*.egg-info/
+.venv/
