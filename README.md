@@ -102,6 +102,19 @@ which includes a contact email address". livelonger:
   of the run
 * stops dead if LJ redirects to the bot-policy page, rather than retrying
 * identifies itself with your contact address
+* rations password logins. LJ temporarily bans IPs that log in too often, and
+  every API call that carries a password counts as a login. A first run uses
+  **one** password login to make a session, then authenticates every call with
+  the session cookie. Later runs reuse the saved session and don't ask for the
+  password at all. If LJ rejects the session, livelonger makes a new one once.
+  It refuses outright to do more than 40 password logins in one run.
+* keeps one connection open per host (HTTP keep-alive) instead of making a
+  new connection for every request
+* retries LJ's transient errors (code 406 "repeated requests" and the 500s)
+  with backoff, and stops on a ban
+* saves every entry and every page of comments the moment it arrives, so an
+  interrupted run resumes where it stopped. A failure in one step (friends,
+  media, ...) is reported and the remaining steps still run.
 * caches every web page, so a re-run never requests the same page twice
 * prefers the bulk API: entries come in batches through
   `getevents(selecttype=syncitems)` (the approach of LJ's own `jbackup.pl`),

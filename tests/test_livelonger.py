@@ -8,6 +8,7 @@ from pathlib import Path
 
 from livelonger import markup, web
 from livelonger.backup_own import OwnBackup
+from livelonger.ljapi import LJError
 from livelonger.http import Response
 from livelonger.linker import Linker, parse_lj_url
 from livelonger.site import SiteBuilder, lj_date
@@ -115,11 +116,27 @@ class WebParseTests(unittest.TestCase):
 class FakeHTTP:
     """Answers the XML-RPC and export_comments calls an owner backup makes."""
 
-    def __init__(self):
+    def __init__(self, n_events=2, cookie_auth=True):
         self.calls = []
         self.cookies_set = {}
         self.delays = {"livejournal": 0}
         self.request_count = 0
+        self.cookie_auth = cookie_auth   # does "LJ" accept auth_method=cookie at all?
+        self.revoked = set()             # ljsession values LJ no longer accepts
+        self.sessions = 0
+        self.faults = {}                 # (method, selecttype) -> [fault codes to raise, in order]
+        self.body_fail_at = None         # comment_body startid that errors once
+        self.EVENTS = list(FakeHTTP.EVENTS) + [
+            {"itemid": i, "anum": 1, "eventtime": "2006-01-01 00:00:00", "subject": f"e{i}",
+             "event": "x", "security": "public", "props": {}} for i in range(3, n_events + 1)]
+
+    def slow_down(self, group="livejournal"):
+        pass
+
+    @staticmethod
+    def fault(url, code, msg):
+        return Response(url, 200, {"Content-Type": "text/xml"}, xmlrpc.client.dumps(
+            xmlrpc.client.Fault(code, msg), methodresponse=True).encode())
 
     def set_cookie(self, k, v, domain=".livejournal.com"):
         self.cookies_set[k] = v
@@ -127,10 +144,47 @@ class FakeHTTP:
     def has_auth(self):
         return bool(self.cookies_set)
 
-    def post(self, url, data, **kw):
+    EVENTS = [
+        {"itemid": 1, "anum": 5, "eventtime": "2005-01-01 09:00:00", "subject": "First",
+         "event": xmlrpc.client.Binary("Héllo\n<lj user=\"poeticdream\">".encode()),
+         "security": "public", "props": {"taglist": "us, love", "current_moodid": 1}},
+        {"itemid": 2, "anum": 6, "eventtime": "2005-02-01 09:00:00", "subject": "Secret",
+         "event": "only us", "security": "usemask", "allowmask": 1, "props": {}},
+    ]
+
+    def getevents(self, params):
+        sel = params["selecttype"]
+        if sel == "syncitems":
+            # simulate LJ returning the same batch over and over (many entries
+            # sharing one modification time): only ever entry 1
+            return {"events": self.EVENTS[:1]}
+        if sel == "multiple":
+            want = {int(x) for x in params["itemids"].split(",")}
+            return {"events": [e for e in self.EVENTS if e["itemid"] in want]}
+        return {"events": [e for e in self.EVENTS if e["itemid"] == params["itemid"]]}
+
+    def post(self, url, data, headers=None, **kw):
         (params,), method = xmlrpc.client.loads(data)
         method = method.split(".")[-1]
-        self.calls.append(method)
+        self.calls.append((method, params.get("auth_method"), (headers or {}).get("X-LJ-Auth"),
+                           params.get("selecttype")))
+        if params.get("auth_method") == "cookie" and (
+                not self.cookie_auth or self.cookies_set.get("ljsession") in self.revoked
+                or "ljsession" not in self.cookies_set):
+            return self.fault(url, 101, "Invalid password")
+        queued = self.faults.get((method, params.get("selecttype")))
+        if queued:
+            code = queued.pop(0)
+            return self.fault(url, code, f"Simulated fault {code} (mentions login and session)")
+        if method == "sessiongenerate":
+            self.sessions += 1
+            res = {"ljsession": f"v1:u7:s{8 + self.sessions}:aXYZ:g1//1"}
+            return Response(url, 200, {"Content-Type": "text/xml"},
+                            xmlrpc.client.dumps((res,), methodresponse=True).encode())
+        if method == "getevents":
+            res = self.getevents(params)
+            return Response(url, 200, {"Content-Type": "text/xml"},
+                            xmlrpc.client.dumps((res,), methodresponse=True).encode())
         res = {
             "getchallenge": {"challenge": "c0:1:2:3:abc"},
             "login": {"userid": 7, "fullname": "Kim", "pickws": ["socks"],
@@ -142,14 +196,8 @@ class FakeHTTP:
                 {"item": "L-1", "action": "create", "time": "2005-01-01 10:00:00"},
                 {"item": "L-2", "action": "create", "time": "2005-02-01 10:00:00"},
                 {"item": "C-9", "action": "create", "time": "2005-02-02 10:00:00"},
-            ], "count": 3, "total": 3},
-            "getevents": {"events": [
-                {"itemid": 1, "anum": 5, "eventtime": "2005-01-01 09:00:00", "subject": "First",
-                 "event": xmlrpc.client.Binary("Héllo\n<lj user=\"poeticdream\">".encode()),
-                 "security": "public", "props": {"taglist": "us, love", "current_moodid": 1}},
-                {"itemid": 2, "anum": 6, "eventtime": "2005-02-01 09:00:00", "subject": "Secret",
-                 "event": "only us", "security": "usemask", "allowmask": 1, "props": {}},
-            ]},
+            ] + [{"item": f"L-{e['itemid']}", "action": "create", "time": "2006-01-01 10:00:00"}
+                 for e in self.EVENTS[2:]], "count": 1, "total": 1},
             "getfriends": {"friends": [{"username": "poeticdream", "fullname": "P", "groupmask": 3}],
                            "friendofs": [{"username": "poeticdream"}],
                            "friendgroups": [{"id": 1, "name": "Close", "sortorder": 1}]},
@@ -165,6 +213,22 @@ class FakeHTTP:
                     "<comment id='2' posterid='7'/><comment id='3' posterid='20' state='S'/></comments>"
                     "<usermaps><usermap id='20' user='poeticdream'/><usermap id='7' user='riffraff'/></usermaps></livejournal>")
         else:
+            start = int(q["startid"][0])
+            if self.body_fail_at is not None and start == self.body_fail_at:
+                self.body_fail_at = None
+                from livelonger.http import FetchError
+                raise FetchError("simulated network failure")
+            pages = {
+                "1": "<comment id='1' jitemid='1' posterid='20'><body>hi love</body><date>2005-01-01T10:00:00Z</date></comment>",
+                "2": "<comment id='2' jitemid='1' posterid='7' parentid='1'><body>hi back</body><date>2005-01-01T11:00:00Z</date></comment>",
+                "3": "<comment id='3' jitemid='2' posterid='20' state='S'><subject>psst</subject><body>secret</body><date>2005-02-01T10:00:00Z</date></comment>",
+            }
+            # one comment per "page", like LJ's 1000-per-request but smaller
+            self.calls.append(("comment_body", start))
+            page = pages.get(str(max(start, 1)), "")
+            return Response(url, 200, {"Content-Type": "text/xml"},
+                            f"<livejournal><comments>{page}</comments></livejournal>".encode())
+        if False:
             body = ("<livejournal><comments>"
                     "<comment id='1' jitemid='1' posterid='20'><body>hi love</body><date>2005-01-01T10:00:00Z</date></comment>"
                     "<comment id='2' jitemid='1' posterid='7' parentid='1'><body>hi back</body><date>2005-01-01T11:00:00Z</date></comment>"
@@ -195,6 +259,26 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(j.load_comments(518)[0]["state"], "S")
             self.assertIn("ljloggedin", http.cookies_set)
             self.assertEqual(http.cookies_set["ljloggedin"], "u7:s9")
+            self.assertEqual(archive.load_session("riffraff")["ljsession"], "v1:u7:s9:aXYZ:g1//1")
+            # exactly two password logins; everything after uses the session cookie
+            pw = [c for c in http.calls if c[1] == "challenge"]
+            self.assertEqual([c[0] for c in pw], ["sessiongenerate"])
+            after = [c for c in http.calls if c[0] not in ("getchallenge", "sessiongenerate", "comment_body")]
+            self.assertTrue(after and all(c[1] == "cookie" and c[2] == "cookie" for c in after))
+            # stalled date walk -> switched to fetching by id list, never one-by-one
+            sels = [c[3] for c in http.calls if c[0] == "getevents"]
+            self.assertEqual(sels, ["syncitems", "syncitems", "multiple"])
+            self.assertEqual(j.state["item_times"], {"1": "2005-01-01 10:00:00", "2": "2005-02-01 10:00:00"})
+
+            # a re-run reuses the saved session: no password needed at all
+            http2 = FakeHTTP()
+            asked = []
+            b2 = OwnBackup(archive, http2, "riffraff", lambda: asked.append(1) or "pw", log=lambda *a: None)
+            b2.login()
+            b2.entries()
+            self.assertEqual(asked, [])
+            self.assertFalse(any(c[1] == "challenge" for c in http2.calls))
+            self.assertEqual([c[3] for c in http2.calls if c[0] == "getevents"], [])  # nothing changed
 
             # a second journal, as if fetched from the web, to test interlinking
             pd = archive.journal("poeticdream")
@@ -245,6 +329,211 @@ def _entry(d, source, body="x"):
 
 def _comment(cid, source, body="c", loaded=True, state="A"):
     return {"source": source, "id": cid, "parent": 0, "body": body, "state": state, "loaded": loaded}
+
+
+class AuthAndOrderingTests(unittest.TestCase):
+    """Review findings: session failures, the login cap, partial failures."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.archive = Archive(Path(self.tmp.name) / "a")
+        from unittest import mock
+        self.nosleep = mock.patch("livelonger.ljapi.time.sleep")
+        self.nosleep.start()
+
+    def tearDown(self):
+        self.nosleep.stop()
+        self.tmp.cleanup()
+
+    def backup(self, http, pw="pw"):
+        return OwnBackup(self.archive, http, "riffraff", (lambda: pw), log=lambda *a: None)
+
+    def pw_logins(self, http):
+        return [c[0] for c in http.calls if c[1] == "challenge"]
+
+    def test_revoked_session_is_refreshed_once(self):
+        from livelonger.ljapi import session_cookies
+        old = "v1:u7:s1:aOLD:g1//1"
+        self.archive.save_session("riffraff", session_cookies(old))
+        http = FakeHTTP()
+        http.revoked.add(old)
+        b = self.backup(http)
+        b.login()
+        b.entries()
+        b.connections()
+        self.assertEqual(self.pw_logins(http), ["sessiongenerate"])   # exactly one
+        self.assertNotEqual(self.archive.load_session("riffraff")["ljsession"], old)
+        self.assertEqual(len(b.j.entry_ids()), 2)
+
+    def test_no_cookie_auth_falls_back_then_stops_cleanly(self):
+        from livelonger.ljapi import StopRun
+        http = FakeHTTP(cookie_auth=False)
+        b = self.backup(http)
+        b.api.MAX_PASSWORD_LOGINS = 4
+        with self.assertRaises(StopRun):
+            b.login()
+            b.entries()
+        self.assertLessEqual(len(self.pw_logins(http)), 4)
+
+    def test_non_auth_fault_mentioning_login_keeps_session(self):
+        http = FakeHTTP()
+        b = self.backup(http)
+        b.login()
+        http.faults[("getfriends", None)] = [300]
+        with self.assertRaises(LJError):
+            b.connections()
+        self.assertTrue(b.api.session)
+        self.assertEqual(self.pw_logins(http), ["sessiongenerate"])
+
+    def test_empty_password_sends_nothing(self):
+        from livelonger.ljapi import StopRun
+        http = FakeHTTP()
+        with self.assertRaises(StopRun):
+            self.backup(http, pw="").login()
+        self.assertEqual(http.calls, [])
+
+    def _ones(self, http):
+        return sum(1 for c in http.calls if c[3] == "one")
+
+    def test_failed_chunk_only_affects_that_chunk(self):
+        http = FakeHTTP(n_events=150)
+        http.faults[("getevents", "multiple")] = [302]   # not "unsupported"
+        b = self.backup(http)
+        b.login()
+        b.entries()
+        self.assertEqual(len(b.j.entry_ids()), 150)
+        self.assertEqual(self._ones(http), 100)  # only the failed chunk of 100; the rest batched
+
+    def test_unsupported_multiple_goes_one_by_one(self):
+        http = FakeHTTP(n_events=150)
+        http.faults[("getevents", "multiple")] = [203]
+        b = self.backup(http)
+        b.login()
+        b.entries()
+        self.assertEqual(len(b.j.entry_ids()), 150)
+        self.assertEqual(self._ones(http), 149)
+
+    def test_entries_saved_even_if_run_dies(self):
+        from livelonger.ljapi import StopRun
+        http = FakeHTTP(n_events=150)
+        http.faults[("getevents", "multiple")] = [402]   # banned mid-run
+        b = self.backup(http)
+        b.login()
+        with self.assertRaises(StopRun):
+            b.entries()
+        # entry 1 arrived before the ban and was saved, and so was its sync state
+        self.assertEqual(b.j.entry_ids(), [261])
+        self.assertIn("1", b.j.state["item_times"])
+
+    def test_comment_pages_persist_and_resume(self):
+        from livelonger.http import FetchError
+        http = FakeHTTP()
+        b = self.backup(http)
+        b.login()
+        b.entries()
+        http.body_fail_at = 3
+        with self.assertRaises(FetchError):
+            b.comments()
+        self.assertEqual(sorted(b.j.get("comment_bodies")), ["1", "2"])
+        http.calls.clear()
+        b.comments()
+        self.assertEqual([c for c in http.calls if c[0] == "comment_body"], [("comment_body", 3)])
+        self.assertEqual(len(b.j.load_comments(261)), 2)
+
+
+class HTTPTests(unittest.TestCase):
+    """Real sockets against a local server: keep-alive, cookies, gzip, cache."""
+
+    @classmethod
+    def setUpClass(cls):
+        import gzip as _gz
+        import http.server
+        import threading
+
+        class H(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, *a):
+                pass
+
+            def do_GET(self):
+                body = (self.headers.get("Cookie") or "").encode()
+                extra = {}
+                if self.path == "/set":
+                    extra["Set-Cookie"] = "flavor=oat; Path=/"
+                if self.path == "/gz":
+                    body = _gz.compress(b"zipped!")
+                    extra["Content-Encoding"] = "gzip"
+                if self.path == "/redirect":
+                    self.send_response(302)
+                    self.send_header("Location", "/set")
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                self.send_response(200)
+                for k, v in extra.items():
+                    self.send_header(k, v)
+                self.send_header("Content-Type", "text/plain")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        cls.srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+        cls.base = f"http://127.0.0.1:{cls.srv.server_address[1]}"
+        threading.Thread(target=cls.srv.serve_forever, daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.srv.shutdown()
+
+    def client(self, cache=None):
+        from livelonger.http import PoliteClient
+        return PoliteClient("test", delay=0, other_delay=0, cache_dir=cache, log=lambda *a: None)
+
+    def test_keepalive_cookies_redirect_gzip(self):
+        c = self.client()
+        c.get(self.base + "/redirect")             # 302 -> /set, sets a cookie
+        r = c.get(self.base + "/echo")
+        self.assertEqual(r.text, "flavor=oat")     # cookie sent back
+        self.assertEqual(c.get(self.base + "/gz").text, "zipped!")
+        self.assertEqual(c.request_count, 4)
+        self.assertEqual(c.connection_count, 1)    # one connection for everything
+        c.close()
+
+    def test_reconnects_when_server_drops_idle_connection(self):
+        c = self.client()
+        c.get(self.base + "/a")
+        for conn in c._conns.values():
+            conn.sock.close()                      # simulate the server hanging up
+        self.assertEqual(c.get(self.base + "/b").status, 200)
+        c.close()
+
+    def test_cache_is_per_login(self):
+        with tempfile.TemporaryDirectory() as d:
+            c = self.client(Path(d))
+            url = "https://riffraff.livejournal.com/1.html"
+            self.assertEqual(c.auth_fingerprint(), "")
+            c.set_cookie("ljsession", "A")
+            fa = c.auth_fingerprint()
+            c.set_cookie("ljsession", "B")
+            self.assertNotEqual(fa, c.auth_fingerprint())
+            self.assertNotEqual(c._cache_paths("GET", url, None, fa),
+                                c._cache_paths("GET", url, None, c.auth_fingerprint()))
+
+
+class BanTests(unittest.TestCase):
+    def test_ban_fault_stops_run(self):
+        from livelonger.http import Blocked
+        from livelonger.ljapi import LJClient
+
+        class Banned(FakeHTTP):
+            def post(self, url, data, headers=None, **kw):
+                fault = xmlrpc.client.Fault(402, "Client error:  Your IP address is temporarily banned "
+                                                 "for exceeding the login failure rate.")
+                return Response(url, 200, {}, xmlrpc.client.dumps(fault, methodresponse=True).encode())
+
+        with self.assertRaises(Blocked):
+            LJClient(Banned(), "x", "pw", log=lambda *a: None).challenge()
 
 
 class MergeTests(unittest.TestCase):

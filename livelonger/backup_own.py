@@ -12,7 +12,7 @@ import json
 import time
 
 from .http import PoliteClient
-from .ljapi import CommentExporter, LJClient, LJError, session_cookies
+from .ljapi import UNSUPPORTED_FAULTS, CommentExporter, LJClient, LJError
 from .store import Archive, Journal, journal_base_url, live_count, norm_user
 
 TS_FMT = "%Y-%m-%d %H:%M:%S"
@@ -59,12 +59,16 @@ def normalize_api_entry(ev: dict, user: str, moods: dict, pics: dict) -> dict:
 
 
 class OwnBackup:
-    def __init__(self, archive: Archive, http: PoliteClient, user: str, password: str,
+    def __init__(self, archive: Archive, http: PoliteClient, user: str, password=None,
                  log=print, full: bool = False):
+        """password: a string, or a zero-argument callable asked only if a
+        password login turns out to be necessary."""
         self.archive = archive
         self.http = http
         self.user = norm_user(user)
-        self.api = LJClient(http, self.user, password=password)
+        self.api = LJClient(http, self.user, log=log, password=password if isinstance(password, str) else None,
+                            password_provider=None if isinstance(password, str) else password,
+                            on_new_session=lambda c: archive.save_session(self.user, c))
         self.j: Journal = archive.journal(self.user)
         self.log = log
         self.full = full
@@ -80,7 +84,17 @@ class OwnBackup:
         return info
 
     def login(self) -> dict:
-        self.log(f"Logging in to the LiveJournal API as {self.user}…")
+        saved = self.archive.load_session(self.user)
+        if saved:
+            # reuse the session from a previous run: no password login at all
+            self.log(f"Connecting to the LiveJournal API as {self.user} (saved session)…")
+            for k, v in saved.items():
+                self.http.set_cookie(k, v)
+            self.api.use_session()
+        else:
+            # one password login makes a session; everything after uses it
+            self.log(f"Logging in to the LiveJournal API as {self.user}…")
+            self.api.new_session()
         info = self.api.login()
         self.j.raw("login.json", json.dumps(info, ensure_ascii=False, indent=1))
         pics = {}
@@ -96,13 +110,8 @@ class OwnBackup:
             fullname=info.get("fullname"), archived_at=int(time.time()),
             url=journal_base_url(self.user),
         )
-        # a web session (cookie) for comment export and friends-locked pages
-        ljsession = self.api.sessiongenerate()
-        cookies = session_cookies(ljsession)
-        for k, v in cookies.items():
-            self.http.set_cookie(k, v)
-        self.archive.save_session(self.user, cookies)
-        self.log("  logged in; session saved for later web fetches")
+        self.log(f"  connected ({self.api.password_logins} password login"
+                 f"{'' if self.api.password_logins == 1 else 's'} this run; session saved)")
         return info
 
     # ------------------------------------------------------------------
@@ -128,62 +137,101 @@ class OwnBackup:
 
     def entries(self):
         st = self.j.state
-        known: dict = {} if self.full else st.get("item_times", {})
+        known: dict = {} if self.full else dict(st.get("item_times", {}))
         self.log("Listing entries (syncitems)…")
         items = self._syncitems()
         need = {i: t for i, t in items.items() if known.get(str(i)) != t}
         self.log(f"  {len(items)} entries in journal, {len(need)} new or changed")
+        st["deleted_on_lj"] = sorted(int(x) for x in set(known) - {str(i) for i in items})
         if not need:
+            self.j.save_state(st)
             return
-        fetched: dict[int, dict] = {}
-
-        # Bulk: getevents(selecttype=syncitems) returns many entries per call,
-        # everything modified after lastsync. Walk forward through time.
         remaining = dict(need)
-        stalls = 0
-        while remaining and stalls < 2:
-            lastsync = _minus_one_second(min(remaining.values()))
-            try:
-                r = self.api.call("getevents", {
-                    "selecttype": "syncitems", "lastsync": lastsync,
-                    "lineendings": "unix",
-                })
-            except LJError as e:
-                self.log(f"  bulk fetch failed ({e}); falling back to one at a time")
-                break
-            events = r.get("events") or []
-            progress = 0
+        done = 0
+        unsaved = 0
+
+        def flush():
+            nonlocal unsaved
+            st["item_times"] = known
+            self.j.save_state(st)
+            unsaved = 0
+
+        def store(events):
+            """Save entries the moment they arrive, so an interruption loses nothing.
+            (The sync bookkeeping is flushed every 25 entries and on exit; if it
+            lags, a re-run just re-requests those few entries.)"""
+            nonlocal done, unsaved
+            got = 0
             for ev in events:
                 iid = int(ev["itemid"])
-                if iid not in fetched:
-                    fetched[iid] = ev
-                if iid in remaining:
-                    del remaining[iid]
-                    progress += 1
-            self.log(f"  fetched {len(fetched)}/{len(need)} entries")
-            stalls = 0 if progress else stalls + 1
+                self.j.raw(f"events/{iid}.json", json.dumps(ev, ensure_ascii=False, indent=1))
+                self.j.save_entry(normalize_api_entry(ev, self.user, self.moods, self.pics), force=True)
+                if iid in items:
+                    known[str(iid)] = items[iid]
+                    unsaved += 1
+                if remaining.pop(iid, None) is not None:
+                    got += 1
+            done += got
+            if unsaved >= 25:
+                flush()
+            return got
 
-        for iid in sorted(remaining):
-            r = self.api.call("getevents", {"selecttype": "one", "itemid": iid,
-                                            "lineendings": "unix"})
-            for ev in r.get("events") or []:
-                fetched[int(ev["itemid"])] = ev
-            self.log(f"  fetched entry {iid} individually")
+        try:
+            self._fetch_entries(remaining, need, store, lambda: done)
+        finally:
+            flush()
+        if remaining:
+            self.log(f"  WARNING: LJ returned nothing for {len(remaining)} entries: {sorted(remaining)[:20]}")
 
-        for iid, ev in fetched.items():
-            self.j.raw(f"events/{iid}.json", json.dumps(ev, ensure_ascii=False, indent=1))
-            e = normalize_api_entry(ev, self.user, self.moods, self.pics)
-            self.j.save_entry(e, force=True)
-            if iid in items:
-                known[str(iid)] = items[iid]
-        st["item_times"] = known
-        # entries deleted on LJ since last time are kept locally, but noted
-        gone = set(known) - {str(i) for i in items}
-        st["deleted_on_lj"] = sorted(int(x) for x in gone)
-        self.j.save_state(st)
-        missing = set(need) - set(fetched)
-        if missing:
-            self.log(f"  WARNING: could not fetch {len(missing)} entries: {sorted(missing)[:20]}")
+    def _fetch_entries(self, remaining, need, store, done):
+        # 1. Walk forward through modification times: getevents(syncitems)
+        #    returns up to ~100 entries changed after `lastsync` per call.
+        #    If more than a batch share one timestamp (LJ bulk-touched many old
+        #    entries at once), this stops making progress: move on.
+        while remaining:
+            lastsync = _minus_one_second(min(remaining.values()))
+            try:
+                r = self.api.call("getevents", {"selecttype": "syncitems", "lastsync": lastsync,
+                                                "lineendings": "unix"})
+            except LJError as e:
+                self.log(f"  bulk fetch by date failed ({e})")
+                break
+            if not store(r.get("events") or []):
+                self.log(f"  {len(remaining)} entries share modification times; fetching those by id")
+                break
+            self.log(f"  fetched {done()}/{len(need)} entries")
+
+        # 2. Ask for specific entries, 100 per call. Only an "unsupported
+        #    argument" answer turns this off; other errors skip one chunk,
+        #    whose entries then fall through to step 3.
+        ids = sorted(remaining)
+        while ids:
+            chunk, ids = ids[:100], ids[100:]
+            try:
+                r = self.api.call("getevents", {"selecttype": "multiple",
+                                                "itemids": ",".join(map(str, chunk)),
+                                                "lineendings": "unix"})
+            except LJError as e:
+                if e.code in UNSUPPORTED_FAULTS:
+                    self.log(f"  LJ doesn't support fetching by id list ({e}); going one at a time")
+                    break
+                self.log(f"  a batch of {len(chunk)} failed ({e}); will retry those individually")
+                continue
+            store(r.get("events") or [])
+            self.log(f"  fetched {done()}/{len(need)} entries")
+
+        # 3. Last resort: one per call (session-authenticated, so no logins).
+        stragglers = sorted(remaining)
+        for n, iid in enumerate(stragglers, 1):
+            try:
+                r = self.api.call("getevents", {"selecttype": "one", "itemid": iid,
+                                                "lineendings": "unix"})
+            except LJError as e:
+                self.log(f"  entry {iid}: {e}")
+                continue
+            store(r.get("events") or [])
+            if n % 25 == 0 or n == len(stragglers):
+                self.log(f"  fetched {done()}/{len(need)} entries")
 
     # ------------------------------------------------------------------
     def comments(self):
@@ -198,12 +246,17 @@ class OwnBackup:
 
         bodies = {} if self.full else {int(k): v for k, v in (self.j.get("comment_bodies", {}) or {}).items()}
         start = 0 if self.full else (max(bodies) + 1 if bodies else 0)
+        def persist(batch):
+            # saved after every page (~1000 comments): an interruption costs one page
+            bodies.update(batch)
+            self.j.put("comment_bodies", {str(k): v for k, v in sorted(bodies.items())})
+
         if start <= maxid:
-            new = exp.bodies(
+            exp.bodies(
                 start, maxid, on_raw=lambda n, b: self.j.raw(f"comments/{n}", b),
                 progress=lambda n, last, mx: self.log(f"  comment bodies: up to #{last} of {mx}"),
+                on_batch=persist,
             )
-            bodies.update(new)
         # states change (screened/unscreened/deleted); refresh from meta
         for cid, m in meta.items():
             if cid in bodies:

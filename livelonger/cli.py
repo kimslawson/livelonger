@@ -44,58 +44,62 @@ def cmd_init(args, cfg):
     log(f"Wrote {p}. Next: `livelonger backup YOUR_LJ_USERNAME`")
 
 
+def _phase(name, fn, *a, **kw):
+    """Run one stage of a backup. A failure in one stage is reported and the
+    next stage still runs; only a StopRun/Blocked ends the whole run."""
+    from .ljapi import LJError
+    try:
+        return fn(*a, **kw)
+    except (LJError, FetchError) as e:
+        log(f"  {name} failed: {e}\n  (continuing with the next step; re-run later to retry this one)")
+
+
 def cmd_backup(args, cfg):
     from .backup_own import OwnBackup
     from .ljapi import LJError
     archive = Archive(cfg.archive_dir)
     http = make_client(cfg, archive)
     user = norm_user(args.user)
-    password = get_password(user, args.password_env)
-    b = OwnBackup(archive, http, user, password, log=log, full=args.full)
+    b = OwnBackup(archive, http, user, lambda: get_password(user, args.password_env),
+                  log=log, full=args.full)
     try:
         b.login()
     except LJError as e:
         sys.exit(f"Login failed: {e}\n(Forgot the password? https://www.livejournal.com/lostinfo.bml)")
-    b.entries()
+    _phase("entries", b.entries)
     if not args.no_comments:
-        try:
-            b.comments()
-        except LJError as e:
-            log(f"  comment export failed: {e}\n  You can still get comments from the web pages with:\n"
-                f"    livelonger fetch {user} --as {user} --refresh")
+        if _phase("comment export", b.comments) is None and not b.j.get("comment_bodies"):
+            log(f"  You can also get comments from the web pages: livelonger fetch {user} --as {user}")
     if not args.no_connections:
-        b.connections()
+        _phase("friends/tags", b.connections)
     # profile + userpics + style come from public pages
     from .web import WebFetcher
-    wf = WebFetcher(archive, http, user, log=log)
-    try:
-        wf.profile()
-    except FetchError as e:
-        log(f"  (profile: {e})")
+    _phase("profile", WebFetcher(archive, http, user, log=log).profile)
     if not args.no_embeds:
-        b.enrich_embeds()
+        _phase("embeds", b.enrich_embeds)
     if not args.no_comments and not args.no_commenter_userpics:
-        b.commenter_userpics()
+        _phase("commenter userpics", b.commenter_userpics)
     if not args.no_theme:
         _theme(cfg, archive, http, user)
     if not args.no_media:
         from .media import download_all
-        download_all(archive, http, users=[user], log=log)
-    log(f"\nDone. {http.request_count} requests. Build the site with `livelonger build`.")
+        _phase("media", download_all, archive, http, users=[user], log=log)
+    http.close()
+    log(f"\nDone. {http.request_count} requests over {http.connection_count} connections, "
+        f"{b.api.password_logins} password login(s). Build the site with `livelonger build`.")
 
 
 def cmd_login(args, cfg):
-    from .ljapi import LJClient, LJError, session_cookies
+    from .ljapi import LJClient, LJError
     archive = Archive(cfg.archive_dir)
     http = make_client(cfg, archive)
     user = norm_user(args.user)
-    api = LJClient(http, user, password=get_password(user, args.password_env))
+    api = LJClient(http, user, log=log, password_provider=lambda: get_password(user, args.password_env),
+                   on_new_session=lambda c: archive.save_session(user, c))
     try:
-        api.login()
-        cookies = session_cookies(api.sessiongenerate())
+        api.new_session()  # exactly one password login
     except LJError as e:
         sys.exit(f"Login failed: {e}")
-    archive.save_session(user, cookies)
     log(f"Session saved for {user}. Use `livelonger fetch SOMEONE --as {user}`.")
 
 
@@ -128,8 +132,9 @@ def cmd_fetch(args, cfg):
             _theme(cfg, archive, http, user)
     if not args.no_media:
         from .media import download_all
-        download_all(archive, http, users=[norm_user(u) for u in args.users], log=log)
-    log(f"\nDone. {http.request_count} requests.")
+        _phase("media", download_all, archive, http, users=[norm_user(u) for u in args.users], log=log)
+    http.close()
+    log(f"\nDone. {http.request_count} requests over {http.connection_count} connections.")
 
 
 def _theme(cfg, archive, http, user):

@@ -155,12 +155,14 @@ def download_all(archive: Archive, http: PoliteClient, users=None, retry_failed=
             (retry_failed or not (store.index.get(MediaStore._norm(u)) or {}).get("error"))]
     log(f"Media: {len(urls)} referenced, {len(todo)} to download")
     ok = 0
-    for n, u in enumerate(todo, 1):
-        if store.fetch(http, u, retry_failed=retry_failed, log=log):
-            ok += 1
-        if n % 50 == 0:
-            log(f"  {n}/{len(todo)} tried, {ok} saved")
-    store.save()
+    try:
+        for n, u in enumerate(todo, 1):
+            if store.fetch(http, u, retry_failed=retry_failed, log=log):
+                ok += 1
+            if n % 50 == 0:
+                log(f"  {n}/{len(todo)} tried, {ok} saved")
+    finally:
+        store.save()  # even on Ctrl-C: downloaded files stay known
     failed = len(todo) - ok
     log(f"  media done: {ok} saved, {failed} unavailable (dead links are normal for old journals)")
     return store

@@ -1,25 +1,28 @@
 """A deliberately polite HTTP client.
 
 * strictly sequential (no threads, no parallel connections)
+* keep-alive: one persistent connection per host, reused for every request,
+  so a long run is a handful of TLS handshakes rather than thousands
 * a minimum gap between requests to the same host group (all of
   *.livejournal.com / *.livejournal.net count as one group)
 * identifies itself with a User-Agent containing a contact address
 * honours Retry-After, backs off exponentially on 429/5xx, and permanently
   slows down for the rest of the run after any throttling signal
 * stops immediately if LiveJournal redirects us to its bot-policy page
-* optional on-disk cache so re-runs never re-request the same URL
+* optional on-disk cache so re-runs never re-request the same URL. The cache
+  is keyed by *which* login the request carried, so pages cached under one
+  session (or none) are never served for another.
 """
 from __future__ import annotations
 
 import gzip
 import hashlib
+import http.client
 import http.cookiejar
 import json
-import os
 import random
 import socket
 import time
-import urllib.error
 import urllib.parse
 import urllib.request
 import zlib
@@ -27,6 +30,10 @@ from pathlib import Path
 
 RETRY_STATUSES = {429, 500, 502, 503, 504, 520, 521, 522, 524}
 AUTH_COOKIES = {"ljsession", "ljmastersession", "ljloggedin"}
+# errors that just mean a kept-alive connection went stale between requests
+STALE_CONN = (http.client.RemoteDisconnected, http.client.CannotSendRequest,
+              http.client.ResponseNotReady, BrokenPipeError, ConnectionResetError,
+              ConnectionAbortedError)
 
 
 class Blocked(RuntimeError):
@@ -44,9 +51,12 @@ class Response:
     def __init__(self, url, status, headers, body: bytes, from_cache=False):
         self.url = url
         self.status = status
-        self.headers = headers
+        self.headers = {k.lower(): v for k, v in dict(headers or {}).items()}
         self.body = body
         self.from_cache = from_cache
+
+    def header(self, name: str, default=None):
+        return self.headers.get(name.lower(), default)
 
     @property
     def ok(self):
@@ -54,11 +64,11 @@ class Response:
 
     @property
     def content_type(self) -> str:
-        return (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+        return (self.header("content-type") or "").split(";")[0].strip().lower()
 
     @property
     def text(self) -> str:
-        ct = self.headers.get("Content-Type") or ""
+        ct = self.header("content-type") or ""
         enc = "utf-8"
         if "charset=" in ct:
             enc = ct.split("charset=")[-1].split(";")[0].strip() or "utf-8"
@@ -78,13 +88,6 @@ def host_group(url: str) -> str:
     return host
 
 
-class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    """We follow redirects ourselves so each hop is throttled and inspected."""
-
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        return None
-
-
 class PoliteClient:
     def __init__(self, user_agent: str, delay: float = 1.5, other_delay: float = 0.5,
                  cache_dir: Path | None = None, max_retries: int = 6, log=print,
@@ -97,11 +100,15 @@ class PoliteClient:
         self.log = log
         self.timeout = timeout
         self.jar = http.cookiejar.CookieJar()
-        self.opener = urllib.request.build_opener(
-            urllib.request.HTTPCookieProcessor(self.jar), _NoRedirect()
-        )
+        self._conns: dict[tuple, http.client.HTTPConnection] = {}
         self._last: dict[str, float] = {}
         self.request_count = 0
+        self.connection_count = 0
+
+    def close(self):
+        for c in self._conns.values():
+            c.close()
+        self._conns.clear()
 
     # -- cookies --------------------------------------------------------
     def set_cookie(self, name: str, value: str, domain: str = ".livejournal.com"):
@@ -116,8 +123,19 @@ class PoliteClient:
     def cookies(self) -> dict:
         return {c.name: c.value for c in self.jar}
 
+    def _auth_cookies(self) -> list[tuple[str, str]]:
+        return sorted((c.name, c.value) for c in self.jar
+                      if c.name in AUTH_COOKIES or c.name.startswith("ljdomsess"))
+
     def has_auth(self) -> bool:
-        return any(c.name in AUTH_COOKIES or c.name.startswith("ljdomsess") for c in self.jar)
+        return bool(self._auth_cookies())
+
+    def auth_fingerprint(self) -> str:
+        """Identifies the login the cookie jar currently carries ('' if none)."""
+        ac = self._auth_cookies()
+        if not ac:
+            return ""
+        return hashlib.sha256(repr(ac).encode()).hexdigest()[:16]
 
     def load_cookie_file(self, path: Path):
         """Accept a Netscape cookies.txt export, or a raw `a=b; c=d` header."""
@@ -146,7 +164,7 @@ class PoliteClient:
             if gap < delay:
                 time.sleep(delay - gap)
 
-    def _slow_down(self, group: str):
+    def slow_down(self, group: str = "livejournal"):
         if group == "livejournal":
             old = self.delays["livejournal"]
             self.delays["livejournal"] = min(old * 1.5, 30.0)
@@ -165,7 +183,7 @@ class PoliteClient:
                 cache: bool = False, method: str | None = None, max_redirects: int = 8,
                 allow_status=(404, 410, 403)) -> Response:
         method = method or ("POST" if data is not None else "GET")
-        auth = self.has_auth() and host_group(url) == "livejournal"
+        auth = self.auth_fingerprint() if host_group(url) == "livejournal" else ""
         if cache and self.cache_dir:
             body_p, meta_p = self._cache_paths(method, url, data, auth)
             if meta_p.exists() and body_p.exists():
@@ -179,8 +197,9 @@ class PoliteClient:
             body_p, meta_p = self._cache_paths(method, url, data, auth)
             body_p.parent.mkdir(parents=True, exist_ok=True)
             body_p.write_bytes(resp.body)
+            # metadata last: an interrupted write leaves no half-cached entry
             meta_p.write_text(json.dumps({"url": resp.url, "status": resp.status,
-                                          "headers": dict(resp.headers), "fetched": time.time()}))
+                                          "headers": resp.headers, "fetched": time.time()}))
         return resp
 
     def get(self, url, **kw) -> Response:
@@ -189,29 +208,60 @@ class PoliteClient:
     def post(self, url, data: bytes, **kw) -> Response:
         return self.request(url, data=data, **kw)
 
+    # -- transport ------------------------------------------------------
+    def _send(self, url, data, headers, method):
+        """One HTTP exchange over a reused keep-alive connection."""
+        sp = urllib.parse.urlsplit(url)
+        key = (sp.scheme, sp.hostname, sp.port)
+        path = (sp.path or "/") + (f"?{sp.query}" if sp.query else "")
+        req = urllib.request.Request(url, data=data, method=method)
+        req.add_header("User-Agent", self.user_agent)
+        req.add_header("Accept-Encoding", "gzip, deflate")
+        for k, v in headers.items():
+            req.add_header(k, v)
+        self.jar.add_cookie_header(req)
+        send_headers = dict(req.header_items())
+
+        for attempt in range(2):
+            conn = self._conns.get(key)
+            fresh = conn is None
+            if fresh:
+                cls = http.client.HTTPSConnection if sp.scheme == "https" else http.client.HTTPConnection
+                conn = cls(sp.hostname, sp.port, timeout=self.timeout)
+                self._conns[key] = conn
+                self.connection_count += 1
+            try:
+                conn.request(method, path, body=data, headers=send_headers)
+                resp = conn.getresponse()
+                body = resp.read()
+            except STALE_CONN:
+                conn.close()
+                self._conns.pop(key, None)
+                if fresh or attempt:
+                    raise
+                continue  # the server closed our idle connection; reconnect once
+            except BaseException:
+                conn.close()
+                self._conns.pop(key, None)
+                raise
+            if resp.will_close:
+                conn.close()
+                self._conns.pop(key, None)
+            self.jar.extract_cookies(resp, req)
+            return resp.status, dict(resp.headers.items()), body
+        raise ConnectionError("unreachable")
+
     def _fetch(self, url, data, headers, method, max_redirects, allow_status) -> Response:
         attempt = 0
         redirects = 0
         while True:
             group = host_group(url)
             self._wait(group)
-            req = urllib.request.Request(url, data=data, method=method)
-            req.add_header("User-Agent", self.user_agent)
-            req.add_header("Accept-Encoding", "gzip, deflate")
-            for k, v in headers.items():
-                req.add_header(k, v)
-            status, hdrs, body, final = None, {}, b"", url
             err = None
+            status, hdrs, body = None, {}, b""
             try:
-                with self.opener.open(req, timeout=self.timeout) as r:
-                    status, hdrs, body = r.status, dict(r.headers), r.read()
-            except urllib.error.HTTPError as e:
-                status, hdrs = e.code, dict(e.headers or {})
-                try:
-                    body = e.read()
-                except Exception:
-                    body = b""
-            except (urllib.error.URLError, socket.timeout, TimeoutError, ConnectionError, OSError) as e:
+                status, hdrs, body = self._send(url, data, headers, method)
+            except (OSError, http.client.HTTPException) as e:
                 err = e
             finally:
                 self._last[group] = time.monotonic()
@@ -220,30 +270,31 @@ class PoliteClient:
             if err is not None:
                 reason = getattr(err, "reason", err)
                 # DNS failures for dead image hosts: don't bother retrying
-                if isinstance(reason, socket.gaierror) or "Name or service not known" in str(reason) \
-                        or "nodename nor servname" in str(reason):
+                if isinstance(err, socket.gaierror) or "nodename nor servname" in str(reason) \
+                        or "Name or service not known" in str(reason):
                     raise FetchError(f"host not found: {reason}", url=url)
                 attempt += 1
                 if attempt > self.max_retries:
                     raise FetchError(f"network error after {attempt} tries: {reason}", url=url)
                 wait = min(300, (2 ** attempt) * 2) + random.random()
-                self.log(f"  network error ({reason}); retrying in {wait:.0f}s")
+                self.log(f"  network error ({reason!r}); retrying in {wait:.0f}s")
                 time.sleep(wait)
                 continue
 
-            enc = (hdrs.get("Content-Encoding") or hdrs.get("content-encoding") or "").lower()
+            r = Response(url, status, hdrs, body)
+            enc = (r.header("content-encoding") or "").lower()
             if enc == "gzip" and body:
                 try:
-                    body = gzip.decompress(body)
+                    r.body = gzip.decompress(body)
                 except OSError:
                     pass
             elif enc == "deflate" and body:
                 try:
-                    body = zlib.decompress(body)
+                    r.body = zlib.decompress(body)
                 except zlib.error:
-                    body = zlib.decompress(body, -zlib.MAX_WBITS)
+                    r.body = zlib.decompress(body, -zlib.MAX_WBITS)
 
-            location = hdrs.get("Location") or hdrs.get("location")
+            location = r.header("location")
             if status in (301, 302, 303, 307, 308) and location:
                 new = urllib.parse.urljoin(url, location)
                 if "/bots" in urllib.parse.urlsplit(new).path:
@@ -256,16 +307,16 @@ class PoliteClient:
                 url = new
                 continue
 
-            if group == "livejournal" and status == 403 and b"/bots" in body[:20000] \
-                    and b"Bot Policy" in body[:20000]:
+            if group == "livejournal" and status == 403 and b"/bots" in r.body[:20000] \
+                    and b"Bot Policy" in r.body[:20000]:
                 raise Blocked(self._blocked_msg(url))
 
             if status in RETRY_STATUSES:
                 attempt += 1
-                self._slow_down(group)
+                self.slow_down(group)
                 if attempt > self.max_retries:
                     raise FetchError(f"HTTP {status} after {attempt} tries", status, url)
-                ra = hdrs.get("Retry-After") or hdrs.get("retry-after")
+                ra = r.header("retry-after")
                 try:
                     wait = float(ra) if ra else min(600, (2 ** attempt) * 5)
                 except ValueError:
@@ -277,7 +328,8 @@ class PoliteClient:
 
             if status >= 400 and status not in allow_status:
                 raise FetchError(f"HTTP {status}", status, url)
-            return Response(url, status, hdrs, body)
+            r.url = url
+            return r
 
     @staticmethod
     def _blocked_msg(url):
