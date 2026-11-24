@@ -12,7 +12,8 @@ import json
 import time
 
 from .http import PoliteClient
-from .ljapi import UNSUPPORTED_FAULTS, CommentExporter, LJClient, LJError
+from . import webauth
+from .ljapi import UNSUPPORTED_FAULTS, CommentExporter, LJClient, LJError, NotLoggedIn
 from .store import Archive, Journal, journal_base_url, live_count, norm_user
 
 TS_FMT = "%Y-%m-%d %H:%M:%S"
@@ -89,11 +90,16 @@ class OwnBackup:
         self.user = norm_user(user)
         self.api = LJClient(http, self.user, log=log, password=password if isinstance(password, str) else None,
                             password_provider=None if isinstance(password, str) else password,
-                            on_new_session=lambda c: archive.save_session(self.user, c))
+                            on_new_session=self._session_made)
         self.j: Journal = archive.journal(self.user)
         self.log = log
         self.full = full
         self.problem_entries: list[int] = []
+
+    def _session_made(self, cookies):
+        if self.archive.session_info(self.user).get("source") == "browser":
+            return  # never replace working browser cookies with an API session
+        self.archive.save_session(self.user, cookies, source="api")
 
     # ------------------------------------------------------------------
     def run(self, comments=True, connections=True):
@@ -107,17 +113,20 @@ class OwnBackup:
 
     def login(self) -> dict:
         st = self.j.state
-        saved = self.archive.load_session(self.user)
-        if saved:
-            for k, v in saved.items():
-                self.http.set_cookie(k, v)  # still good for comment export / web pages
-        if st.get("api_cookie_auth") is False:
+        sess = self.archive.session_info(self.user)
+        saved = sess.get("cookies")
+        if saved:  # still good for the website (comment export, locked pages)
+            webauth.apply(self.http, saved, sess.get("variant") or "all")
+        if sess.get("source") == "browser":
+            # browser cookies are for the website; the API gets password logins,
+            # and we never make an API session that would replace them
+            self.api.cookie_auth_ok = False
+            self.log(f"Logging in to the LiveJournal API as {self.user} (website: browser cookies)…")
+        elif st.get("api_cookie_auth") is False:
             # learned on an earlier run: LJ's API won't take session cookies,
             # so don't spend (failed) login attempts finding that out again
+            self.api.cookie_auth_ok = False
             self.log(f"Logging in to the LiveJournal API as {self.user}…")
-            if not saved:
-                self.api.new_session()
-                self.api.session = False
         elif saved:
             self.log(f"Connecting to the LiveJournal API as {self.user} (saved session)…")
             self.api.use_session()
@@ -148,21 +157,23 @@ class OwnBackup:
         return info
 
     # ------------------------------------------------------------------
-    def _syncitems(self) -> dict[int, str]:
-        """All entry itemids with their last-modified times (one call per ~500)."""
+    def _syncitems(self, since: str = "") -> dict[int, str]:
+        """Entry itemids with last-modified times, changed after `since`
+        (everything if empty). ~300 per call; each call is a password login
+        now that LJ's API refuses sessions, so re-runs list only changes."""
         items: dict[int, str] = {}
-        lastsync = ""
+        lastsync = since
         while True:
             params = {"lastsync": lastsync} if lastsync else {}
             r = self.api.call("syncitems", params)
             got = r.get("syncitems") or []
             newest = lastsync
             for it in got:
-                kind, _, num = it["item"].partition("-")
+                kind, _, num = str(it["item"]).partition("-")
                 if kind == "L":
-                    items[int(num)] = it["time"]
-                newest = max(newest, it["time"])
-            self.log(f"  syncitems: {len(items)} entries listed so far")
+                    items[int(num)] = str(it["time"])
+                newest = max(newest, str(it["time"]))
+            self.log(f"  syncitems: {len(items)} {'changed ' if since else ''}entries listed so far")
             if not got or newest == lastsync or int(r.get("count", 0)) >= int(r.get("total", 0)):
                 break
             lastsync = newest
@@ -171,12 +182,20 @@ class OwnBackup:
     def entries(self):
         st = self.j.state
         known: dict = {} if self.full else dict(st.get("item_times", {}))
-        self.log("Listing entries (syncitems)…")
-        items = self._syncitems()
+        since = "" if self.full else st.get("lastsync", "")
+        self.log("Listing entries (syncitems)" + (f", changes since {since}…" if since else "…"))
+        listed = self._syncitems(since)
+        if since:
+            items = {int(k): v for k, v in known.items()}
+            items.update(listed)
+        else:
+            items = listed
+            st["deleted_on_lj"] = sorted(int(x) for x in set(known) - {str(i) for i in items})
         need = {i: t for i, t in items.items() if known.get(str(i)) != t}
         self.log(f"  {len(items)} entries in journal, {len(need)} new or changed")
-        st["deleted_on_lj"] = sorted(int(x) for x in set(known) - {str(i) for i in items})
+        newest = max(items.values(), default="")
         if not need:
+            st["lastsync"] = newest
             self.j.save_state(st)
             return
         remaining = dict(need)
@@ -219,6 +238,9 @@ class OwnBackup:
         try:
             self._fetch_entries(remaining, need, store, lambda: done)
         finally:
+            # only move the "listed up to" mark once everything listed is safely in
+            if not remaining and not self.problem_entries:
+                st["lastsync"] = newest
             flush()
         if remaining:
             self.log(f"  WARNING: LJ returned nothing for {len(remaining)} entries: {sorted(remaining)[:20]}")
@@ -279,17 +301,7 @@ class OwnBackup:
         st = self.j.state
         exp = CommentExporter(self.http)
         raw = lambda n, b: self.j.raw(f"comments/{n}", b)  # noqa: E731
-        try:
-            meta, users, maxid = exp.meta(0, on_raw=raw)
-        except LJError as e:
-            if self.api.session_fresh:
-                raise
-            # the saved session may have expired: one new session, one retry
-            self.log(f"  ({e}; making a new session)")
-            self.api.new_session()
-            if self.api.cookie_auth_ok is False:
-                self.api.session = False  # the new cookie is for the export, not the API
-            meta, users, maxid = exp.meta(0, on_raw=raw)
+        meta, users, maxid = self._export_meta_logged_in(exp, raw)
         known_users = self.j.get("users", {}) or {}
         known_users.update(users)
         self.j.put("users", known_users)
@@ -308,6 +320,8 @@ class OwnBackup:
                 progress=lambda n, last, mx: self.log(f"  comment bodies: up to #{last} of {mx}"),
                 on_batch=persist,
             )
+        for note in exp.salvage_notes:
+            self.log(f"  note: {note}")
         # states change (screened/unscreened/deleted); refresh from meta
         for cid, m in meta.items():
             if cid in bodies:
@@ -316,6 +330,40 @@ class OwnBackup:
         st["comments_maxid"] = maxid
         self.j.save_state(st)
         self._distribute_comments(bodies, known_users)
+
+    def _export_meta_logged_in(self, exp, raw):
+        """Run the first export request, finding a cookie style the website
+        accepts (one request per style, no password logins)."""
+        sess = self.archive.session_info(self.user)
+        if not sess.get("cookies"):
+            raise LJError("no session saved; run `livelonger login "
+                          f"{self.user} --cookies FILE` (see README)")
+        result = {}
+
+        def probe():
+            try:
+                result["meta"] = exp.meta(0, on_raw=raw)
+                return True
+            except NotLoggedIn:
+                return False
+
+        variant = webauth.find_working(self.http, sess["cookies"], probe,
+                                       source=sess.get("source", "api"), first=sess.get("variant"))
+        if variant is None and sess.get("source") != "browser" and sess.get("variant"):
+            # a style that used to work stopped: the session probably expired
+            self.log("  (saved session expired; making a new one)")
+            self.api.new_session()
+            sess = self.archive.session_info(self.user)
+            variant = webauth.find_working(self.http, sess["cookies"], probe, first=sess.get("variant"))
+        if variant is None:
+            tried = "your browser cookies" if sess.get("source") == "browser" else "3 cookie styles"
+            raise LJError("the website didn't accept our login.\n" +
+                          webauth.BROWSER_HELP.format(tried=tried, user=self.user))
+        if variant != sess.get("variant"):
+            self.archive.save_session(self.user, sess["cookies"], source=sess.get("source", "api"),
+                                      variant=variant)
+            self.log(f"  (website login works with cookie style '{variant}'; remembered)")
+        return result["meta"]
 
     def _distribute_comments(self, bodies: dict, users: dict):
         # jitemid -> anum so we can build public ids (dtalkid = jtalkid*256 + anum)
@@ -397,16 +445,19 @@ class OwnBackup:
     def enrich_embeds(self):
         """Entries with <lj-embed> or polls: grab LJ's rendered body (one page
         load each) so videos/polls display. Everything else stays API-only."""
-        from .web import parse_entry_page
+        from .web import parse_entry_page, site_layout
         todo = [e for e in self.j.entries()
                 if e.get("source") == "api" and not e.get("rendered_body")
                 and re.search(r"<lj-(embed|poll)", e.get("body") or "", re.I)]
         if not todo:
             return
         self.log(f"Fetching rendered pages for {len(todo)} entries with embeds/polls…")
+        if any(e.get("security") != "public" for e in todo):
+            if not webauth.ensure_journal_login(self.http, self.archive, self.user, self.user, self.log):
+                todo = [e for e in todo if e.get("security") == "public"]
         for e in todo:
             try:
-                r = self.http.get(e["url"], cache=True)
+                r = self.http.get(site_layout(e["url"]), cache=True)
             except Exception as ex:  # noqa: BLE001
                 self.log(f"  {e['ditemid']}: {ex}")
                 continue
@@ -414,6 +465,9 @@ class OwnBackup:
             if parsed and parsed["entry"]["body"]:
                 e["rendered_body"] = parsed["entry"]["body"]
                 self.j.save_entry(e, force=True)
+            else:
+                self.log(f"  {e['ditemid']}: couldn't read the rendered entry"
+                         f" ({'login page' if 'login.bml' in r.url else 'unrecognised page layout'})")
 
     # ------------------------------------------------------------------
     def connections(self):

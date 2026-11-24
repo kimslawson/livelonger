@@ -116,7 +116,8 @@ class WebParseTests(unittest.TestCase):
 class FakeHTTP:
     """Answers the XML-RPC and export_comments calls an owner backup makes."""
 
-    def __init__(self, n_events=2, cookie_auth=True):
+    def __init__(self, n_events=2, cookie_auth=True, web_accepts="all"):
+        self.web_accepts = web_accepts   # cookie combination the *website* accepts, or None
         self.calls = []
         self.cookies_set = {}
         self.delays = {"livejournal": 0}
@@ -140,6 +141,15 @@ class FakeHTTP:
 
     def set_cookie(self, k, v, domain=".livejournal.com"):
         self.cookies_set[k] = v
+
+    def remove_cookie(self, k):
+        self.cookies_set.pop(k, None)
+
+    def web_logged_in(self):
+        present = {k for k in self.cookies_set if k in ("ljsession", "ljmastersession", "ljloggedin")}
+        return bool(present) and {
+            "all": True, "ljsession": present == {"ljsession"},
+            "master": present == {"ljmastersession", "ljloggedin"}}.get(self.web_accepts, False)
 
     def has_auth(self):
         return bool(self.cookies_set)
@@ -169,7 +179,7 @@ class FakeHTTP:
         (params,), method = xmlrpc.client.loads(data)
         method = method.split(".")[-1]
         self.calls.append((method, params.get("auth_method"), (headers or {}).get("X-LJ-Auth"),
-                           params.get("selecttype")))
+                           params.get("selecttype"), params.get("lastsync")))
         if params.get("auth_method") == "cookie" and (
                 not self.cookie_auth or self.cookies_set.get("ljsession") in self.revoked
                 or "ljsession" not in self.cookies_set):
@@ -211,6 +221,10 @@ class FakeHTTP:
 
     def get(self, url, **kw):
         q = urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)
+        if "export_comments" in url and not self.web_logged_in():
+            self.calls.append(("export_bounced", None))
+            return Response("https://www.livejournal.com/login.bml?returnto=x", 200,
+                            {"Content-Type": "text/html"}, b"<html>Log in</html>")
         if "comment_meta" in q.get("get", []):
             body = ("<livejournal><maxid>3</maxid><comments><comment id='1' posterid='20'/>"
                     "<comment id='2' posterid='7'/><comment id='3' posterid='20' state='S'/></comments>"
@@ -318,6 +332,16 @@ class PipelineTests(unittest.TestCase):
 
 
 class ThemeTests(unittest.TestCase):
+    def test_site_chrome_vs_style_css(self):
+        from livelonger.theme import _site_css
+        L = "https://l-stat.livejournal.net/"
+        self.assertTrue(_site_css(L + "??schemius_v4/header_v5.css,lj_base-journal.css?v=1"))
+        self.assertTrue(_site_css(L + "??svg/flaticon.css,proximanova-opentype.css?v=1"))
+        self.assertFalse(_site_css(L + "??sup/s/style.css,sup/s/spring-daze.css?v=1"))   # minimalism
+        self.assertFalse(_site_css(L + "??voxhtml/base.css,voxhtml/bloom/screen.css"))    # bloom
+        self.assertFalse(_site_css("https://riffraff.livejournal.com/res/12139202/stylesheet?1"))
+        self.assertTrue(_site_css(""))
+
     def test_content_column(self):
         base = journal_base_url("x")
         page = (f'<html><body><div id="header"><a href="{base}">home</a></div>'
@@ -428,6 +452,57 @@ class AuthAndOrderingTests(unittest.TestCase):
         self.assertEqual(cli.FAILED_STEPS, ["demo"])
         cli.FAILED_STEPS.clear()
 
+    def test_website_cookie_style_is_found_and_remembered(self):
+        http = FakeHTTP(web_accepts="ljsession")    # site ignores ljsession if master cookies present
+        b = self.backup(http)
+        b.login()
+        b.entries()
+        b.comments()
+        self.assertEqual(len(b.j.load_comments(261)), 2)
+        self.assertEqual(self.archive.session_info("riffraff")["variant"], "ljsession")
+        self.assertEqual(self.pw_logins(http), ["sessiongenerate"])   # probing costs no logins
+        # next run goes straight to the working style
+        http2 = FakeHTTP(web_accepts="ljsession")
+        b2 = self.backup(http2)
+        b2.login()
+        b2.comments()
+        self.assertEqual([c for c in http2.calls if c[0] == "export_bounced"], [])
+
+    def test_website_refuses_every_style_points_to_browser_cookies(self):
+        http = FakeHTTP(web_accepts=None)
+        b = self.backup(http)
+        b.login()
+        with self.assertRaises(LJError) as cm:
+            b.comments()
+        self.assertIn("--cookies", str(cm.exception))
+        self.assertEqual(len([c for c in http.calls if c[0] == "export_bounced"]), 3)
+        self.assertEqual(self.pw_logins(http), ["sessiongenerate"])   # no new sessions burned
+
+    def test_browser_cookies_used_as_is(self):
+        self.archive.save_session("riffraff", {"ljmastersession": "m", "ljloggedin": "u:s",
+                                               "ljuniq": "x"}, source="browser", variant="all")
+        http = FakeHTTP(web_accepts="master")
+        b = self.backup(http)
+        b.login()
+        b.comments()
+        self.assertEqual(http.cookies_set.get("ljuniq"), "x")
+        self.assertEqual([c for c in http.calls if c[0] == "export_bounced"], [])
+
+    def test_rerun_lists_only_changes(self):
+        http = FakeHTTP(cookie_auth=False)
+        b = self.backup(http)
+        b.login()
+        b.entries()
+        http2 = FakeHTTP(cookie_auth=False)
+        b2 = self.backup(http2)
+        b2.login()
+        b2.entries()
+        b2.connections()
+        sync = [c for c in http2.calls if c[0] == "syncitems"]
+        self.assertEqual(len(sync), 1)
+        self.assertEqual(sync[0][4], "2005-02-01 10:00:00")    # newest entry time seen
+        self.assertEqual([c for c in http2.calls if c[1] == "cookie"], [])  # learned setting obeyed
+
     def test_empty_password_sends_nothing(self):
         from livelonger.ljapi import StopRun
         http = FakeHTTP()
@@ -507,6 +582,12 @@ class HTTPTests(unittest.TestCase):
                 if self.path == "/gz":
                     body = _gz.compress(b"zipped!")
                     extra["Content-Encoding"] = "gzip"
+                if self.path.startswith("/loop"):
+                    self.send_response(302)
+                    self.send_header("Location", "/loop?v=SECRETSESSIONKEY")
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
                 if self.path == "/redirect":
                     self.send_response(302)
                     self.send_header("Location", "/set")
@@ -551,6 +632,30 @@ class HTTPTests(unittest.TestCase):
         self.assertEqual(c.get(self.base + "/b").status, 200)
         c.close()
 
+    def test_redirect_loop_reports_chain_without_secrets(self):
+        from livelonger.http import FetchError
+        c = self.client()
+        with self.assertRaises(FetchError) as cm:
+            c.get(self.base + "/loop")
+        msg = str(cm.exception)
+        self.assertIn("too many redirects", msg)
+        self.assertIn("/loop?v", msg)
+        self.assertNotIn("SECRETSESSIONKEY", msg)
+        c.close()
+
+    def test_login_bounces_are_not_cached(self):
+        with tempfile.TemporaryDirectory() as d:
+            c = self.client(Path(d))
+            c.get(self.base + "/redirect", cache=True)          # ordinary redirect: cached
+            self.assertTrue(any(Path(d).rglob("*.json")))
+            from livelonger.http import Response
+            n = len(list(Path(d).rglob("*.json")))
+            c._fetch = lambda *a, **k: Response("https://www.livejournal.com/login.bml?returnto=x",
+                                                200, {}, b"Log in")
+            c.get("https://pd.livejournal.com/5.html", cache=True)
+            self.assertEqual(len(list(Path(d).rglob("*.json"))), n)   # login page not cached
+            c.close()
+
     def test_cache_is_per_login(self):
         with tempfile.TemporaryDirectory() as d:
             c = self.client(Path(d))
@@ -562,6 +667,152 @@ class HTTPTests(unittest.TestCase):
             self.assertNotEqual(fa, c.auth_fingerprint())
             self.assertNotEqual(c._cache_paths("GET", url, None, fa),
                                 c._cache_paths("GET", url, None, c.auth_fingerprint()))
+
+
+class LayoutAndSpamTests(unittest.TestCase):
+    def test_site_layout_urls(self):
+        from livelonger.web import site_layout
+        u = "https://pd.livejournal.com/1.html"
+        self.assertEqual(site_layout(u), u + "?style=site")
+        self.assertEqual(site_layout(u, page=2), u + "?style=site&page=2")
+        self.assertEqual(site_layout(u, thread=77), u + "?style=site&thread=77")
+
+    def test_journal_styled_page_still_yields_body(self):
+        page = ('<script>Site.entry = {"title":"T","is_public":false,"eventtime":1};'
+                'Site.page = {"replycount":3,"comments":[]};</script>'
+                '<div class="asset-content"><div class="asset-body">Bloom body</div></div>')
+        p = web.parse_entry_page(page, "pd", 9, "u")
+        self.assertEqual(p["entry"]["body"], "Bloom body")
+        self.assertEqual(p["entry"]["layout"], "journal-style")
+        self.assertTrue(p["comments_unreadable"])
+
+    def test_s2_comments_margin_and_nested(self):
+        from livelonger.web import parse_s2_comments, parse_s2_date
+        margin = (
+            '<div id="ljcmt10" class="comment-wrap" style="margin-left:0px;"><span data-ljuser="kim"></span>'
+            '<img src="https://l-userpic.livejournal.com/1/2"><span class="comment-datetimelink">2009-08-02 09:54 am (local)</span>'
+            '<div class="comment-text">first</div></div>'
+            '<div id="ljcmt11" style="margin-left:25px;"><span data-ljuser="pd"></span>'
+            '<span class="comment-datetimelink">2009-08-02 02:52 pm</span><div class="comment-text">reply</div></div>'
+            '<div id="ljcmt12" style="margin-left:50px;"><div class="comment-text">anon deep</div></div>'
+            '<div id="ljcmt13" style="margin-left:0px;"><div class="comment-text">second root</div></div>')
+        cs = parse_s2_comments(htmltree.parse(margin), 1)
+        self.assertEqual([(c["id"], c["parent"]) for c in cs], [(10, 0), (11, 10), (12, 11), (13, 0)])
+        self.assertEqual(cs[0]["date"], "2009-08-02 09:54:00")
+        self.assertEqual(cs[1]["date"], "2009-08-02 14:52:00")
+        self.assertEqual((cs[0]["poster"], cs[2]["poster"]), ("kim", None))
+        self.assertTrue(cs[0]["userpic_url"].startswith("https://l-userpic"))
+        nested = ('<div id="ljcmt20"><div class="comment-body">outer</div>'
+                  '<div id="ljcmt21"><div class="comment-body">inner</div></div></div>')
+        cs = parse_s2_comments(htmltree.parse(nested), 1)
+        self.assertEqual([(c["id"], c["parent"], c["body"]) for c in cs],
+                         [(20, 0, "outer"), (21, 20, "inner")])
+        self.assertEqual(parse_s2_date("Apr. 9th, 2013 at 2:08 PM"), "2013-04-09 14:08:00")
+
+    def test_spam_hidden_from_site(self):
+        with tempfile.TemporaryDirectory() as d:
+            a = Archive(Path(d) / "a")
+            j = a.journal("kim")
+            j.update_meta(username="kim", source="api")
+            j.save_entry({"source": "api", "ditemid": 256, "itemid": 1, "anum": 0, "body": "hi",
+                          "body_format": "lj", "eventtime": "2005-01-01 00:00:00", "subject": "",
+                          "security": "public", "comment_count": 2})
+            j.save_comments(256, [{"source": "api", "id": 1, "parent": 0, "state": "A", "body": "real",
+                                   "body_format": "lj", "poster": "pd"},
+                                  {"source": "api", "id": 2, "parent": 0, "state": "B", "body": "BUY PILLS",
+                                   "body_format": "lj", "poster": None}])
+            SiteBuilder(a, Path(d) / "s", log=lambda *x: None).build()
+            page = (Path(d) / "s" / "kim" / "256.html").read_text()
+            self.assertIn("real", page)
+            self.assertNotIn("BUY PILLS", page)
+            self.assertIn("1 comment<", page)
+            self.assertNotIn("PILLS", (Path(d) / "s" / "kim" / "search-data.js").read_text())
+
+
+class LenientExportTests(unittest.TestCase):
+    def test_parse_levels(self):
+        from livelonger.ljapi import parse_export_xml
+        ok = b"<livejournal><comments><comment id='1'><body>ok</body></comment></comments></livejournal>"
+        self.assertEqual(parse_export_xml(ok)[1], "")
+        win = b"<livejournal><comments><comment id='1'><body>\x93hi\x94\x0b</body></comment></comments></livejournal>"
+        root, note = parse_export_xml(win)
+        self.assertEqual(root.find(".//body").text, "\u201chi\u201d")
+        self.assertIn("repaired", note)
+        broken = (b"<livejournal><maxid>2</maxid><comments><comment id='1'><body>a</body></comment>"
+                  b"<comment id='2'><body><b></body></comment></comments></livejournal>")
+        root, note = parse_export_xml(broken)
+        self.assertEqual([c.get("id") for c in root.iter("comment")], ["1"])
+        self.assertEqual(root.findtext("maxid"), "2")
+        self.assertIn("1 unreadable", note)
+
+
+class JournalLoginTests(unittest.TestCase):
+    class Web:
+        """A journal subdomain that recognises only one cookie combination."""
+
+        def __init__(self, accepts):
+            self.accepts, self.cookies, self.gets = accepts, {}, 0
+            self.log = lambda *a: None
+
+        def set_cookie(self, k, v, domain=None):
+            self.cookies[k] = v
+
+        def remove_cookie(self, k):
+            self.cookies.pop(k, None)
+
+        def get(self, url, **kw):
+            self.gets += 1
+            present = {k for k in self.cookies if k in ("ljsession", "ljmastersession", "ljloggedin")}
+            ok = {"all": len(present) == 3, "ljsession": present == {"ljsession"}}.get(self.accepts, False)
+            remote = '{"username":"riffraff"}' if ok else "null"
+            return Response(url, 200, {"Content-Type": "text/html"},
+                            f"<script>Site.remote = {remote};</script>".encode())
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.archive = Archive(Path(self.tmp.name))
+        self.archive.save_session("riffraff", {"ljsession": "s", "ljmastersession": "s",
+                                               "ljloggedin": "u:s"}, source="api", variant="ljsession")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_finds_and_remembers_journal_style(self):
+        from livelonger.webauth import ensure_journal_login
+        web = self.Web("all")
+        self.assertTrue(ensure_journal_login(web, self.archive, "riffraff", "poeticdream", log=lambda *a: None))
+        self.assertEqual(self.archive.session_info("riffraff")["journal_variant"], "all")
+        self.assertEqual(self.archive.session_info("riffraff")["variant"], "ljsession")  # www style kept
+        web2 = self.Web("all")
+        ensure_journal_login(web2, self.archive, "riffraff", "poeticdream", log=lambda *a: None)
+        self.assertEqual(web2.gets, 1)   # remembered: first try works
+
+    def test_warns_when_nothing_works(self):
+        from livelonger.webauth import ensure_journal_login
+        msgs = []
+        self.assertFalse(ensure_journal_login(self.Web(None), self.archive, "riffraff", "poeticdream",
+                                              log=msgs.append))
+        self.assertIn("--cookies", msgs[0])
+
+
+class MediaHostTests(unittest.TestCase):
+    def test_gives_up_on_unresponsive_host(self):
+        from livelonger.http import FetchError
+        from livelonger.media import MediaStore
+
+        class Dead:
+            calls = 0
+
+            def get(self, url, **kw):
+                Dead.calls += 1
+                raise FetchError("network error: RemoteDisconnected", url=url)
+
+        with tempfile.TemporaryDirectory() as d:
+            store = MediaStore(Archive(Path(d)))
+            for i in range(5):
+                store.fetch(Dead(), f"http://old.example/{i}.jpg", log=lambda *a: None)
+            self.assertEqual(Dead.calls, 2)                 # then the host is skipped
+            self.assertEqual(store.index, {})               # and nothing marked permanently failed
 
 
 class BanTests(unittest.TestCase):

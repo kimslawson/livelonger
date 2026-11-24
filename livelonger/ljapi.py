@@ -9,7 +9,9 @@ export_comments.bml and the web pages (for friends-locked posts) accept.
 """
 from __future__ import annotations
 
+import codecs
 import hashlib
+import re
 import time
 import xml.etree.ElementTree as ET
 import xmlrpc.client
@@ -27,6 +29,10 @@ class LJError(RuntimeError):
         super().__init__(msg)
         self.code = code
         self.fault = fault  # LJ's own fault string, without our decoration
+
+
+class NotLoggedIn(LJError):
+    """The website bounced us to its login page."""
 
 
 class StopRun(Blocked):
@@ -138,7 +144,8 @@ class LJClient:
         cookies = session_cookies(ljsession)
         for k, v in cookies.items():
             self.http.set_cookie(k, v)
-        self.session = True
+        # the cookie is still useful for the website even if the API won't take it
+        self.session = self.cookie_auth_ok is not False
         self.session_fresh = True
         if self.on_new_session:
             self.on_new_session(cookies)
@@ -219,6 +226,59 @@ def session_cookies(ljsession: str) -> dict:
     return cookies
 
 
+# --- lenient XML for old comments ------------------------------------------
+# Comments from 2001-2005 often contain bytes that aren't valid UTF-8 (text
+# pasted from Windows apps) and control characters XML forbids. LJ exports
+# them verbatim, which strict XML parsers reject.
+
+def _cp1252_fallback(err: UnicodeDecodeError):
+    return err.object[err.start:err.end].decode("cp1252", errors="replace"), err.end
+
+
+codecs.register_error("livelonger-cp1252", _cp1252_fallback)
+_XML_ILLEGAL = re.compile("[\x00-\x08\x0b\x0c\x0e-\x1f\ufffe\uffff\ud800-\udfff]")
+_COMMENT_RE = re.compile(rb"<comment\b.*?(?:/>|</comment>)", re.S)
+_USERMAP_RE = re.compile(rb"<usermap\b[^>]*/>")
+_MAXID_RE = re.compile(rb"<maxid>\s*(\d+)\s*</maxid>")
+
+
+def clean_xml_bytes(data: bytes) -> bytes:
+    text = data.decode("utf-8", errors="livelonger-cp1252")
+    return _XML_ILLEGAL.sub("", text).encode("utf-8")
+
+
+def parse_export_xml(data: bytes):
+    """-> (root, note). Strict first; then repaired; then comment-by-comment,
+    dropping only the comments that are still unparseable."""
+    try:
+        return ET.fromstring(data), ""
+    except ET.ParseError:
+        pass
+    cleaned = clean_xml_bytes(data)
+    try:
+        return ET.fromstring(cleaned), "repaired invalid characters"
+    except ET.ParseError:
+        pass
+    root = ET.Element("livelonger")
+    m = _MAXID_RE.search(cleaned)
+    if m:
+        ET.SubElement(root, "maxid").text = m.group(1).decode()
+    comments = ET.SubElement(root, "comments")
+    usermaps = ET.SubElement(root, "usermaps")
+    lost = 0
+    for chunk in _COMMENT_RE.findall(cleaned):
+        try:
+            comments.append(ET.fromstring(chunk))
+        except ET.ParseError:
+            lost += 1
+    for chunk in _USERMAP_RE.findall(cleaned):
+        try:
+            usermaps.append(ET.fromstring(chunk))
+        except ET.ParseError:
+            pass
+    return root, f"parsed comment-by-comment; {lost} unreadable comment(s) skipped (raw kept)"
+
+
 class CommentExporter:
     """export_comments.bml: LJ's purpose-built bulk comment export.
 
@@ -230,32 +290,33 @@ class CommentExporter:
     def __init__(self, http: PoliteClient, authas: str | None = None):
         self.http = http
         self.authas = authas
+        self.salvage_notes: list[str] = []
 
-    def _get(self, kind: str, startid: int):
+    def _get(self, kind: str, startid: int, on_raw=None):
         url = f"{EXPORT_URL}?get={kind}&startid={startid}"
         if self.authas:
             url += f"&authas={self.authas}"
         r = self.http.get(url, allow_status=())
         text = r.body
         if b"<livejournal" not in text[:2000]:
+            if "login.bml" in r.url or b"login" in text[:5000].lower():
+                raise NotLoggedIn("export_comments.bml sent us to the login page")
             raise LJError(
                 "export_comments.bml did not return XML (probably not logged in). "
                 f"Got {r.content_type} from {r.url}"
             )
-        try:
-            return ET.fromstring(text), text
-        except ET.ParseError:
-            # LJ occasionally emits stray control characters; strip them
-            cleaned = bytes(b for b in text if b >= 0x20 or b in (9, 10, 13))
-            return ET.fromstring(cleaned), text
+        if on_raw:  # keep what LJ sent *before* trying to parse it
+            on_raw(f"{kind}_{startid}.xml", text)
+        root, salvaged = parse_export_xml(text)
+        if salvaged:
+            self.salvage_notes.append(f"{kind} page at #{startid}: {salvaged}")
+        return root, text
 
     def meta(self, startid: int = 0, on_raw=None):
         comments, users = {}, {}
         maxid = None
         while True:
-            root, raw = self._get("comment_meta", startid)
-            if on_raw:
-                on_raw(f"comment_meta_{startid}.xml", raw)
+            root, raw = self._get("comment_meta", startid, on_raw)
             mx = root.findtext("maxid")
             maxid = int(mx) if mx and mx.strip().isdigit() else maxid
             last = startid - 1
@@ -276,9 +337,7 @@ class CommentExporter:
         they go; an interruption then costs at most one page."""
         out = {}
         while startid <= maxid:
-            root, raw = self._get("comment_body", startid)
-            if on_raw:
-                on_raw(f"comment_body_{startid}.xml", raw)
+            root, raw = self._get("comment_body", startid, on_raw)
             last = startid - 1
             for c in root.iter("comment"):
                 cid = int(c.get("id"))

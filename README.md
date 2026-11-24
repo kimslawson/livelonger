@@ -44,10 +44,33 @@ livelonger fetch poeticdream --as riffraff --entries 123456    # one specific en
 livelonger build
 ```
 
-`--as` uses the session saved by `backup` (or by `livelonger login riffraff`).
-If LJ doesn't accept it on journal pages, you'll see a warning. In that case,
-export your browser's LiveJournal cookies (a `cookies.txt`, or just the
-`Cookie:` header copied from dev tools) and pass `--cookies that-file`.
+`--as` uses the session saved for that account.
+
+### Logging in to the website (comments, locked posts)
+
+The API takes your password. The *website* needs a login session, and it's
+the website that serves the comment export and other people's locked posts.
+livelonger first tries the session it gets from the API, in a few cookie
+combinations, and remembers whichever one works. If the site refuses all of
+them, give it your browser's cookies instead. This is a one-time step and
+needs no password:
+
+1. Log in at https://www.livejournal.com in your browser.
+2. Open the developer tools, go to the Network tab, and reload the page.
+3. Click the first request to `www.livejournal.com`. Under Request Headers,
+   copy the whole value of `Cookie:` into a file such as `lj-cookies.txt`.
+   A Netscape `cookies.txt` export works too.
+4. Run `livelonger login riffraff --cookies lj-cookies.txt`. It checks which
+   account LJ sees, saves the session, and tells you to delete the file.
+
+Browser cookies are only used on the website. API calls still use your
+password, and nothing ever overwrites the saved browser session.
+
+Each journal's own pages (`name.livejournal.com`) need a separate login on top
+of `www`, which LJ hands out through a redirect. Before walking a journal,
+livelonger checks that the journal's pages see you as logged in. If they
+don't, it warns you before spending requests, because otherwise only public
+entries would be found.
 
 ### Sharing
 

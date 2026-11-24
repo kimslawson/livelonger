@@ -50,6 +50,8 @@ class MediaStore:
         self.index_path = self.dir / "index.json"
         self.index: dict = read_json(self.index_path, {}) or {}
         self._dirty = 0
+        self.host_failures: dict[str, int] = {}
+        self.dead_hosts: set[str] = set()
 
     def save(self):
         write_json(self.index_path, self.index)
@@ -80,9 +82,21 @@ class MediaStore:
         fetch_url = url
         if url.startswith("http://") and any(host.endswith(h) for h in LJ_PIC_HOSTS):
             fetch_url = "https://" + url[7:]
+        if host in self.dead_hosts:
+            return None  # gave up on this host earlier in the run; try again next run
+        lj = host.endswith(("livejournal.com", "livejournal.net"))
         try:
-            r = http.get(fetch_url, allow_status=(403, 404, 410, 400, 401))
+            r = http.get(fetch_url, allow_status=(403, 404, 410, 400, 401), retries=2 if lj else 1)
         except FetchError as e:
+            if e.status is None:  # couldn't even talk to the host
+                self.host_failures[host] = self.host_failures.get(host, 0) + 1
+                if self.host_failures[host] >= 2:
+                    self.dead_hosts.add(host)
+                    log(f"  {host} isn't answering; skipping its remaining images this run")
+                if "host not found" in str(e):
+                    self.index[url] = {"error": str(e)[:200], "at": int(time.time())}
+                    self._bump()
+                return None  # connection trouble isn't recorded as permanent
             self.index[url] = {"error": str(e)[:200], "at": int(time.time())}
             self._bump()
             return None

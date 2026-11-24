@@ -88,6 +88,13 @@ def host_group(url: str) -> str:
     return host
 
 
+def _short(url: str) -> str:
+    """host/path for logs, without query values (they can hold session keys)."""
+    sp = urllib.parse.urlsplit(url)
+    keys = ",".join(k for k, _ in urllib.parse.parse_qsl(sp.query))
+    return f"{sp.hostname}{sp.path}" + (f"?{keys}" if keys else "")
+
+
 class PoliteClient:
     def __init__(self, user_agent: str, delay: float = 1.5, other_delay: float = 0.5,
                  cache_dir: Path | None = None, max_retries: int = 6, log=print,
@@ -119,6 +126,11 @@ class PoliteClient:
             comment=None, comment_url=None, rest={}, rfc2109=False,
         )
         self.jar.set_cookie(c)
+
+    def remove_cookie(self, name: str):
+        for c in list(self.jar):
+            if c.name == name:
+                self.jar.clear(c.domain, c.path, c.name)
 
     def cookies(self) -> dict:
         return {c.name: c.value for c in self.jar}
@@ -181,7 +193,7 @@ class PoliteClient:
     # -- main entry point ----------------------------------------------
     def request(self, url: str, data: bytes | None = None, headers: dict | None = None,
                 cache: bool = False, method: str | None = None, max_redirects: int = 8,
-                allow_status=(404, 410, 403)) -> Response:
+                allow_status=(404, 410, 403), retries: int | None = None) -> Response:
         method = method or ("POST" if data is not None else "GET")
         auth = self.auth_fingerprint() if host_group(url) == "livejournal" else ""
         if cache and self.cache_dir:
@@ -191,9 +203,12 @@ class PoliteClient:
                 return Response(meta["url"], meta["status"], meta["headers"],
                                 body_p.read_bytes(), from_cache=True)
 
-        resp = self._fetch(url, data, headers or {}, method, max_redirects, allow_status)
+        resp = self._fetch(url, data, headers or {}, method, max_redirects, allow_status,
+                           self.max_retries if retries is None else retries)
 
-        if cache and self.cache_dir and resp.status in (200, 404, 410):
+        final_path = urllib.parse.urlsplit(resp.url).path
+        bounced = final_path.endswith("login.bml") or "/bots" in final_path or "get_domain_session" in final_path
+        if cache and self.cache_dir and resp.status in (200, 404, 410) and not bounced:
             body_p, meta_p = self._cache_paths(method, url, data, auth)
             body_p.parent.mkdir(parents=True, exist_ok=True)
             body_p.write_bytes(resp.body)
@@ -251,9 +266,10 @@ class PoliteClient:
             return resp.status, dict(resp.headers.items()), body
         raise ConnectionError("unreachable")
 
-    def _fetch(self, url, data, headers, method, max_redirects, allow_status) -> Response:
+    def _fetch(self, url, data, headers, method, max_redirects, allow_status, max_retries) -> Response:
         attempt = 0
         redirects = 0
+        chain = [url]
         while True:
             group = host_group(url)
             self._wait(group)
@@ -274,10 +290,11 @@ class PoliteClient:
                         or "Name or service not known" in str(reason):
                     raise FetchError(f"host not found: {reason}", url=url)
                 attempt += 1
-                if attempt > self.max_retries:
-                    raise FetchError(f"network error after {attempt} tries: {reason}", url=url)
+                host = urllib.parse.urlsplit(url).hostname
+                if attempt > max_retries:
+                    raise FetchError(f"network error from {host} after {attempt} tries: {reason!r}", url=url)
                 wait = min(300, (2 ** attempt) * 2) + random.random()
-                self.log(f"  network error ({reason!r}); retrying in {wait:.0f}s")
+                self.log(f"  network error from {host} ({type(reason).__name__}); retrying in {wait:.0f}s")
                 time.sleep(wait)
                 continue
 
@@ -300,8 +317,10 @@ class PoliteClient:
                 if "/bots" in urllib.parse.urlsplit(new).path:
                     raise Blocked(self._blocked_msg(new))
                 redirects += 1
+                chain.append(new)
                 if redirects > max_redirects:
-                    raise FetchError("too many redirects", status, url)
+                    hops = " -> ".join(_short(u) for u in chain[:6])
+                    raise FetchError(f"too many redirects ({hops} ...)", status, url)
                 if status == 303 or (status in (301, 302) and method == "POST"):
                     method, data = "GET", None
                 url = new
@@ -314,7 +333,7 @@ class PoliteClient:
             if status in RETRY_STATUSES:
                 attempt += 1
                 self.slow_down(group)
-                if attempt > self.max_retries:
+                if attempt > max_retries:
                     raise FetchError(f"HTTP {status} after {attempt} tries", status, url)
                 ra = r.header("retry-after")
                 try:

@@ -144,6 +144,124 @@ def _ts(ts) -> str:
         return ""
 
 
+S2_BODY_CLASSES = ("asset-body", "entry-content", "entry_text", "entrytext", "entry-text",
+                   "entry_body", "post-content", "b-singlepost-bodywrapper")
+
+
+_CMT_ID = re.compile(r"ljcmt(\d+)$")
+_MARGIN = re.compile(r"margin-left\s*:\s*(\d+)")
+_BODY_CLASSES = ("comment-text", "comment-body", "comment-content", "commenttext", "comment_body",
+                 "comment-entry", "comment_text", "talk-comment-box")
+_DATE_CLASSES = ("comment-datetimelink", "comment-date", "datetime", "comment-datetime", "comment-time")
+_MONTHS = {m: i for i, m in enumerate(
+    ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"], 1)}
+
+
+def _own(el, pred):
+    """First descendant of el matching pred, not looking inside nested comments."""
+    stack = list(reversed([c for c in el.children if isinstance(c, htmltree.Node)]))
+    while stack:
+        n = stack.pop()
+        if _CMT_ID.match(n.attrs.get("id") or ""):
+            continue
+        if pred(n):
+            return n
+        stack.extend(reversed([c for c in n.children if isinstance(c, htmltree.Node)]))
+    return None
+
+
+def parse_s2_date(text: str) -> str:
+    """LJ comment dates as S2 styles print them -> 'YYYY-MM-DD HH:MM:SS'."""
+    t = re.sub(r"\s+", " ", text or "").strip()
+
+    def hm(h, mi, s, ap):
+        h = int(h)
+        if ap:
+            h = h % 12 + (12 if ap.lower() == "pm" else 0)
+        return f"{h:02d}:{int(mi):02d}:{int(s or 0):02d}"
+
+    m = re.search(r"(\d{4})-(\d{2})-(\d{2})[ T,]*(\d{1,2}):(\d{2})(?::(\d{2}))? ?([ap]m)?", t, re.I)
+    if m:
+        return f"{m.group(1)}-{m.group(2)}-{m.group(3)} " + hm(*m.group(4, 5, 6, 7))
+    m = re.search(r"([A-Za-z]{3})[a-z]*\.? (\d{1,2})(?:st|nd|rd|th)?,? (\d{4}),?(?: at)? (\d{1,2}):(\d{2})(?::(\d{2}))? ?([ap]m)?",
+                  t, re.I)
+    if m and m.group(1).lower()[:3] in _MONTHS:
+        return (f"{m.group(3)}-{_MONTHS[m.group(1).lower()[:3]]:02d}-{int(m.group(2)):02d} "
+                + hm(*m.group(4, 5, 6, 7)))
+    return ""
+
+
+def parse_s2_comments(tree: htmltree.Node, ditemid: int) -> list[dict]:
+    """Comments as drawn by a journal's own S2 style. Every S2 layout wraps
+    each comment in an element with id="ljcmt<dtalkid>"; nesting is either
+    by element or by margin-left indentation."""
+    out, stack = [], []  # stack of (indent, id) for margin-based nesting
+    for el in tree.find_all(lambda n: bool(_CMT_ID.match(n.attrs.get("id") or ""))):
+        cid = int(_CMT_ID.match(el.attrs["id"]).group(1))
+        anc = next((a for a in el.ancestors() if _CMT_ID.match(a.attrs.get("id") or "")), None)
+        if anc is not None:
+            parent = int(_CMT_ID.match(anc.attrs["id"]).group(1))
+        else:
+            mm = _MARGIN.search(el.attrs.get("style") or "")
+            indent = int(mm.group(1)) if mm else 0
+            while stack and stack[-1][0] >= indent:
+                stack.pop()
+            parent = stack[-1][1] if stack else 0
+            stack.append((indent, cid))
+        who = _own(el, lambda n: "data-ljuser" in n.attrs or "lj:user" in n.attrs)
+        poster = (who.attrs.get("data-ljuser") or who.attrs.get("lj:user")) if who else None
+        pic = _own(el, lambda n: n.tag == "img" and "userpic" in (n.attrs.get("src") or ""))
+        body_el = None
+        for cls in _BODY_CLASSES:
+            body_el = _own(el, lambda n, cls=cls: cls in n.classes())
+            if body_el is not None:
+                break
+        date_el = None
+        for cls in _DATE_CLASSES:
+            date_el = _own(el, lambda n, cls=cls: cls in n.classes())
+            if date_el is not None:
+                break
+        subj_el = _own(el, lambda n: any(c in n.classes() for c in ("comment-subject", "comment-title")))
+        classes = " ".join(el.classes()) + " " + " ".join(
+            c for n in el.iter() for c in n.classes() if "screened" in c or "deleted" in c)
+        text_all = el.text()
+        state = "A"
+        if "deleted" in classes or (body_el is None and "Deleted comment" in text_all):
+            state = "D"
+        elif "screened" in classes:
+            state = "S"
+        out.append({
+            "source": "web",
+            "id": cid,
+            "parent": parent,
+            "ditemid": ditemid,
+            "poster": norm_user(poster) if poster else None,
+            "poster_display": poster or "",
+            "poster_url": "",
+            "poster_is_identity": bool(poster and poster.startswith("ext_")),
+            "subject": subj_el.inner_html().strip() if subj_el else "",
+            "body": body_el.inner_html().strip() if body_el is not None else "",
+            "body_format": "html",
+            "date": parse_s2_date(date_el.text() if date_el else ""),
+            "state": state,
+            "userpic_url": pic.attrs.get("src", "") if pic else "",
+            "userpic_keyword": pic.attrs.get("alt", "") if pic else "",
+            "loaded": body_el is not None or state == "D",
+            "collapsed": body_el is None and state != "D",
+            "props": {},
+        })
+    return out
+
+
+def site_layout(url: str, **params) -> str:
+    """Ask for LJ's standard page layout (style=site), whose structure and
+    embedded JSON we know, instead of the journal's own S2 style, which LJ
+    uses for logged-in viewers."""
+    from urllib.parse import urlencode
+    q = {"style": "site", **{k: v for k, v in params.items() if v is not None}}
+    return f"{url}?{urlencode(q)}"
+
+
 def parse_entry_page(page: str, user: str, ditemid: int, url: str) -> dict | None:
     """Extract the entry and the comments embedded in an LJ entry page."""
     sentry = site_json(page, "entry") or {}
@@ -152,6 +270,14 @@ def parse_entry_page(page: str, user: str, ditemid: int, url: str) -> dict | Non
         return None
     tree = htmltree.parse(page)
     body_el = tree.by_class("aentry-post__text")
+    styled = body_el is None
+    if styled:
+        # LJ ignored ?style=site and rendered the journal's own S2 style:
+        # try the body containers common S2 layouts use
+        for cls in S2_BODY_CLASSES:
+            body_el = tree.by_class(cls)
+            if body_el is not None:
+                break
     body = ""
     if body_el is not None:
         for junk in body_el.find_all(lambda n: {"ljsale", "aentry-post__slot"} & set(n.classes())):
@@ -200,8 +326,13 @@ def parse_entry_page(page: str, user: str, ditemid: int, url: str) -> dict | Non
         "fetched_logged_in_as": (remote or {}).get("username") if isinstance(remote, dict) else None,
     }
     comments = [web_comment(c, ditemid) for c in spage.get("comments") or []]
+    if not comments and styled:
+        comments = parse_s2_comments(tree, ditemid)
+    entry["layout"] = "journal-style" if styled else "site"
     return {"entry": entry, "comments": [c for c in comments if c],
-            "comments_page": spage.get("comments_page")}
+            "comments_page": spage.get("comments_page"),
+            # comments exist but we can't read them from this layout
+            "comments_unreadable": styled and not comments and entry["reply_count"] > 0}
 
 
 def web_comment(c: dict, ditemid: int) -> dict | None:
@@ -240,11 +371,20 @@ def web_comment(c: dict, ditemid: int) -> dict | None:
     }
 
 
+def whoami(http: PoliteClient, user: str = "") -> str | None:
+    """Who LiveJournal's website thinks we are (None if logged out)."""
+    r = http.get(f"https://www.livejournal.com/allpics.bml?user={user or 'lj'}", cache=False)
+    remote = site_json(r.text, "remote") if r.status == 200 else None
+    if isinstance(remote, dict) and remote.get("username"):
+        return norm_user(remote["username"])
+    return None
+
+
 # ---------------------------------------------------------------------------
 
 class WebFetcher:
     def __init__(self, archive: Archive, http: PoliteClient, user: str, log=print,
-                 refresh: bool = False):
+                 refresh: bool = False, as_user: str | None = None):
         self.archive = archive
         self.http = http
         self.user = norm_user(user)
@@ -252,6 +392,8 @@ class WebFetcher:
         self.j: Journal = archive.journal(self.user)
         self.log = log
         self.refresh = refresh
+        self.as_user = as_user
+        self.reparse = False  # re-read cached pages of already-saved entries
 
     def get(self, url, cache=True):
         return self.http.get(url, cache=cache and not self.refresh)
@@ -326,7 +468,7 @@ class WebFetcher:
     # ------------------------------------------------------------------
     def fetch_entry(self, ditemid: int) -> bool:
         url = f"{self.base}{ditemid}.html"
-        r = self.get(url)
+        r = self.get(site_layout(url))
         if r.status != 200:
             self.log(f"  {ditemid}: HTTP {r.status} (deleted or not visible to you)")
             return False
@@ -338,6 +480,11 @@ class WebFetcher:
             self.log(f"  {ditemid}: couldn't find an entry on the page")
             return False
         entry = parsed["entry"]
+        if parsed.get("comments_unreadable") and not getattr(self, "_warned_style", False):
+            self._warned_style = True
+            self.log(f"  WARNING: {self.user}'s style draws comments in a way livelonger can't read\n"
+                     f"  yet (entry {ditemid} has {entry['reply_count']} replies, none found).\n"
+                     "  Pages are cached, so a fixed version can re-read them with --reparse.")
         if self.http.has_auth() and not entry.get("fetched_logged_in_as") and not getattr(self, "_warned", False):
             self._warned = True
             self.log("  WARNING: LJ isn't treating these page loads as logged in, so friends-locked\n"
@@ -349,7 +496,7 @@ class WebFetcher:
         expected = entry["reply_count"]
         page = 2
         while len(comments) < expected and page < 200:
-            rp = self.get(f"{url}?page={page}")
+            rp = self.get(site_layout(url, page=page))
             p2 = parse_entry_page(rp.text, self.user, ditemid, url) if rp.status == 200 else None
             new = [c for c in (p2 or {}).get("comments", []) if c["id"] not in comments]
             if not new:
@@ -365,7 +512,7 @@ class WebFetcher:
                 break
             done_any = False
             for c in unloaded:
-                rt = self.get(f"{url}?thread={c['id']}")
+                rt = self.get(site_layout(url, thread=c["id"]))
                 pt = parse_entry_page(rt.text, self.user, ditemid, url) if rt.status == 200 else None
                 for nc in (pt or {}).get("comments", []):
                     old = comments.get(nc["id"])
@@ -387,11 +534,15 @@ class WebFetcher:
                 self.profile()
             except FetchError as e:
                 self.log(f"  (profile refresh failed: {e})")
-        if self.http.has_auth():
-            self.log("  fetching while logged in: friends-locked entries you can see will be included")
+        if self.http.has_auth() and self.as_user:
+            from .webauth import ensure_journal_login
+            if ensure_journal_login(self.http, self.archive, self.as_user, self.user, self.log):
+                self.log("  friends-locked entries you can see will be included")
+        elif self.http.has_auth():
+            self.log("  fetching with your browser cookies")
         ids = only or self.discover(years)
         have = set(self.j.entry_ids())
-        todo = [i for i in ids if self.refresh or i not in have]
+        todo = [i for i in ids if self.refresh or self.reparse or i not in have]
         todo.sort(reverse=True)
         if limit:
             todo = todo[:limit]

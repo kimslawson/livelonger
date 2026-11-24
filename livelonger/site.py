@@ -19,7 +19,7 @@ from pathlib import Path
 from . import markup
 from .linker import Linker
 from .media import MediaStore
-from .store import Archive, Journal, journal_base_url, norm_user, slug
+from .store import Archive, Journal, journal_base_url, live_count, norm_user, slug
 from .theme import CONTENT_MARK, ROOT_MARK, TITLE_MARK
 
 PER_PAGE = 20
@@ -88,6 +88,10 @@ class JournalView:
             entries = [e for e in entries if e.get("security") == "public"]
         entries.sort(key=lambda e: (e.get("eventtime") or "", e["ditemid"]))
         self.entries = entries  # oldest first
+        for e in entries:  # recount: excludes deleted comments and LJ-flagged spam
+            cs = j.load_comments(e["ditemid"])
+            if cs:
+                e["comment_count"] = live_count(cs)
         self.by_id = {e["ditemid"]: e for e in entries}
         self.title = (self.meta.get("title") or self.profile.get("journal_title")
                       or self.meta.get("fullname") or self.user)
@@ -262,7 +266,7 @@ class SiteBuilder:
         )
 
     def comments_html(self, v: JournalView, e: dict, depth: int) -> str:
-        cs = v.j.load_comments(e["ditemid"])
+        cs = [c for c in v.j.load_comments(e["ditemid"]) if c.get("state") != "B"]  # spam
         if self.public_only:
             cs = [c for c in cs if c.get("state") not in ("S",)]
         if not cs:
@@ -548,7 +552,7 @@ class SiteBuilder:
             ctext = " ".join(
                 markup.strip_tags(c.get("body") or "") + " " + (c.get("poster") or "")
                 for c in v.j.load_comments(e["ditemid"])
-                if c.get("state") != "D" and not (self.public_only and c.get("state") == "S"))
+                if c.get("state") not in ("D", "B") and not (self.public_only and c.get("state") == "S"))
             data.append([e["ditemid"], (e.get("eventtime") or "")[:10],
                          markup.strip_tags(e.get("subject") or ""), text, ctext, e.get("tags") or []])
         self.write(f"{v.user}/search-data.js",

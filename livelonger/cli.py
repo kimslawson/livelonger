@@ -112,12 +112,27 @@ def cmd_backup(args, cfg):
 
 
 def cmd_login(args, cfg):
-    from .ljapi import LJClient, LJError
     archive = Archive(cfg.archive_dir)
     http = make_client(cfg, archive)
     user = norm_user(args.user)
+    if args.cookies:
+        # cookies from a logged-in browser: no password, and the website accepts them
+        http.load_cookie_file(Path(args.cookies))
+        cookies = http.cookies()
+        from .web import whoami
+        who = whoami(http, user)
+        if who is None:
+            sys.exit("LiveJournal doesn't see those cookies as logged in. Copy them again from a "
+                     "browser where you're logged in (see README).")
+        if who != user:
+            log(f"Note: those cookies are logged in as {who}, not {user}; saving them for {who}.")
+            user = who
+        archive.save_session(user, cookies, source="browser", variant="all")
+        log(f"Logged in as {user} via browser cookies; saved. You can delete {args.cookies} now.")
+        return
+    from .ljapi import LJClient, LJError
     api = LJClient(http, user, log=log, password_provider=lambda: get_password(user, args.password_env),
-                   on_new_session=lambda c: archive.save_session(user, c))
+                   on_new_session=lambda c: archive.save_session(user, c, source="api"))
     try:
         api.new_session()  # exactly one password login
     except LJError as e:
@@ -130,11 +145,12 @@ def _apply_auth(args, archive, http):
         http.load_cookie_file(Path(args.cookies))
         log("  using cookies from " + args.cookies)
     elif getattr(args, "as_user", None):
-        c = archive.load_session(args.as_user)
-        if not c:
-            sys.exit(f"No saved session for {args.as_user}; run `livelonger login {args.as_user}` first.")
-        for k, v in c.items():
-            http.set_cookie(k, v)
+        from . import webauth
+        sess = archive.session_info(args.as_user)
+        if not sess.get("cookies"):
+            sys.exit(f"No saved session for {args.as_user}; run `livelonger login {args.as_user} "
+                     "--cookies FILE` first (see README).")
+        webauth.apply(http, sess["cookies"], sess.get("variant") or "all")
         log(f"  fetching as {args.as_user}")
 
 
@@ -144,9 +160,13 @@ def cmd_fetch(args, cfg):
     http = make_client(cfg, archive)
     _apply_auth(args, archive, http)
     for user in args.users:
-        wf = WebFetcher(archive, http, user, log=log, refresh=args.refresh)
-        if archive.journal(user).meta.get("source") == "api":
-            log(f"{user} has a complete owner backup here; web copies won't overwrite it.")
+        wf = WebFetcher(archive, http, user, log=log, refresh=args.refresh,
+                        as_user=None if args.cookies else args.as_user)
+        wf.reparse = args.reparse
+        if archive.journal(user).meta.get("source") == "api" and not args.entries:
+            log(f"{user} has a complete owner backup here (from the API), so there's nothing to\n"
+                "  add from web pages; skipping. (`livelonger backup` keeps it up to date.)")
+            continue
         years = [int(y) for y in args.years.split(",")] if args.years else None
         only = [int(x) for x in args.entries.split(",")] if args.entries else None
         wf.run(years=years, limit=args.limit, only=only)
@@ -278,9 +298,10 @@ def main(argv=None):
         s.add_argument(f"--no-{flag}", action="store_true")
     s.set_defaults(fn=cmd_backup)
 
-    s = sub.add_parser("login", help="save a web session (for fetching friends-locked entries)")
+    s = sub.add_parser("login", help="save a web session (comment export, friends-locked entries)")
     s.add_argument("user")
     s.add_argument("--password-env")
+    s.add_argument("--cookies", help="cookies from a logged-in browser (Cookie: header or cookies.txt)")
     s.set_defaults(fn=cmd_login)
 
     s = sub.add_parser("fetch", help="archive someone else's journal from its web pages")
@@ -288,6 +309,8 @@ def main(argv=None):
     s.add_argument("--as", dest="as_user", help="use your saved session (see friends-locked entries)")
     s.add_argument("--cookies", help="cookies.txt or raw Cookie header from your browser")
     s.add_argument("--refresh", action="store_true", help="re-fetch pages even if cached")
+    s.add_argument("--reparse", action="store_true",
+                   help="re-read already-saved entries from cached pages (no new requests for them)")
     s.add_argument("--years", help="only these years, e.g. 2004,2005")
     s.add_argument("--entries", help="only these entry ids (the number in NNN.html)")
     s.add_argument("--limit", type=int)

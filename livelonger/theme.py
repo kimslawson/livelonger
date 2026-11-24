@@ -52,18 +52,32 @@ def _is_chrome(n: htmltree.Node) -> bool:
     return (n.attrs.get("id") or "") in CHROME_IDS
 
 
-def _site_css(href: str) -> bool:
-    """Is this stylesheet LJ's site chrome rather than the journal style?
+SITE_CHROME_PREFIXES = (
+    "schemius", "lj_base", "header_v", "medius/", "proximanova", "flatbutton", "popup/",
+    "notifications/", "components/", "widgets/", "msgsystem", "recaptcha", "journalpromo",
+    "categories/", "core/", "svg/", "adv/", "ie.css", "post2017/", "entryunit", "common-post",
+    "updateform", "ljcut", "lj-basestrap", "mainpage", "schemes/", "lj_settings",
+)
 
-    l-stat combo URLs bundle several files: keep the bundle if any part is
-    style-related (voxhtml/, s2, customview), otherwise treat as chrome.
+
+def _site_css(href: str) -> bool:
+    """Is this stylesheet LJ's own site chrome, rather than the journal's style?
+
+    l-stat "combo" URLs (https://l-stat.livejournal.net/??a.css,b.css?v=1)
+    bundle several files. A bundle counts as chrome only if *every* file in it
+    is known chrome; anything else (voxhtml/, sup/s/, the journal's custom
+    stylesheet...) is part of the style and is kept.
     """
-    h = href.lower()
-    if "/res/" in h or "stylesheet" in h:
-        return False
-    if "voxhtml" in h or "/s2" in h or "customview" in h or "/stc/" in h:
-        return False
-    return "l-stat" in h or "livejournal.net" in h or any(x in h for x in SITE_CSS_HINTS)
+    import urllib.parse
+    if not href:
+        return True
+    sp = urllib.parse.urlsplit(href)
+    host = (sp.hostname or "").lower()
+    if not (host.endswith("livejournal.net") or host.startswith("l-stat") or host.startswith("stat.")):
+        return False  # the journal's own host (/res/.../stylesheet) or elsewhere: style
+    raw = href.split("??", 1)[1] if "??" in href else sp.path
+    parts = [x.split("?")[0].lstrip("/") for x in raw.split(",") if x.strip()]
+    return bool(parts) and all(p.startswith(SITE_CHROME_PREFIXES) for p in parts)
 
 
 def find_content_column(tree: htmltree.Node, base: str) -> htmltree.Node | None:

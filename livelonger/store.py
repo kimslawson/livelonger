@@ -85,14 +85,29 @@ class Archive:
         return out
 
     # sessions -------------------------------------------------------
-    def save_session(self, user: str, cookies: dict):
+    def save_session(self, user: str, cookies: dict, source: str = "api", variant: str | None = None):
+        """source: "api" (made by sessiongenerate) or "browser" (copied from a
+        logged-in browser). variant: which cookie combination LJ's website
+        accepted (see webauth.VARIANTS), once known."""
         p = self.sessions_dir / f"{norm_user(user)}.json"
-        write_json(p, {"user": norm_user(user), "cookies": cookies, "saved": time.time()})
+        write_json(p, {"user": norm_user(user), "cookies": cookies, "source": source,
+                       "variant": variant, "saved": time.time()})
         os.chmod(p, 0o600)
 
+    def update_session(self, user: str, **fields):
+        p = self.sessions_dir / f"{norm_user(user)}.json"
+        d = read_json(p) or {}
+        if d:
+            d.update(fields)
+            write_json(p, d)
+            os.chmod(p, 0o600)
+
+    def session_info(self, user: str) -> dict:
+        return read_json(self.sessions_dir / f"{norm_user(user)}.json") or {}
+
     def load_session(self, user: str) -> dict | None:
-        d = read_json(self.sessions_dir / f"{norm_user(user)}.json")
-        return d["cookies"] if d else None
+        d = self.session_info(user)
+        return d.get("cookies") or None
 
 
 class Journal:
@@ -203,8 +218,11 @@ def merge_comments(old: list[dict], new: list[dict], prefer_new: bool = True):
     return sorted(by_id.values(), key=lambda c: c["id"]), added, updated
 
 
+HIDDEN_STATES = {"D", "B"}  # deleted; B = marked as spam by LJ
+
+
 def live_count(comments: list[dict]) -> int:
-    return sum(1 for c in comments if c.get("state") != "D")
+    return sum(1 for c in comments if c.get("state") not in HIDDEN_STATES)
 
 
 _slug_re = re.compile(r"[^a-z0-9]+")
