@@ -161,6 +161,7 @@ def parse_entry_page(page: str, user: str, ditemid: int, url: str) -> dict | Non
     subject = sentry.get("title")
     if subject is None and title_el is not None:
         subject = title_el.inner_html().strip()
+    subject = "" if subject is None else str(subject)  # JSON may hand us a number
     tags = []
     tags_el = tree.by_class("aentry-tags")
     if tags_el is not None:
@@ -223,11 +224,11 @@ def web_comment(c: dict, ditemid: int) -> dict | None:
         "parent": int(c.get("parent") or 0),
         "ditemid": ditemid,
         "poster": norm_user(poster) if poster and not u0.get("is_identity") else poster,
-        "poster_display": c.get("dname") or poster,
+        "poster_display": str(c.get("dname") or poster or ""),
         "poster_url": u0.get("journal_url") or "",
         "poster_is_identity": bool(u0.get("is_identity")),
-        "subject": c.get("subject") or "",
-        "body": c.get("article") or "",
+        "subject": str(c.get("subject") or ""),
+        "body": str(c.get("article") or ""),
         "body_format": "html",
         "date": _ts(c.get("ctime_ts")).replace(" ", "T") + "Z" if c.get("ctime_ts") else (c.get("ctime") or ""),
         "state": state,

@@ -25,37 +25,58 @@ def _minus_one_second(ts: str) -> str:
         return ts
 
 
+def txt(v) -> str:
+    """LJ's XML-RPC sends anything that looks like a number as a number (a tag
+    list of just "411", a subject of "2008"...). Text fields are always text."""
+    if v is None:
+        return ""
+    if isinstance(v, bytes):
+        return v.decode("utf-8", errors="replace")
+    return str(v)
+
+
 def normalize_api_entry(ev: dict, user: str, moods: dict, pics: dict) -> dict:
     props = ev.get("props") or {}
     itemid, anum = int(ev["itemid"]), int(ev.get("anum") or 0)
     ditemid = itemid * 256 + anum
-    tags = [t.strip() for t in (props.get("taglist") or "").split(",") if t.strip()]
-    mood = props.get("current_mood") or moods.get(str(props.get("current_moodid", "")), "")
-    kw = props.get("picture_keyword") or ""
+    tags = [t.strip() for t in txt(props.get("taglist")).split(",") if t.strip()]
+    mood = txt(props.get("current_mood")) or moods.get(txt(props.get("current_moodid")), "")
+    kw = txt(props.get("picture_keyword"))
     return {
         "source": "api",
         "journal": user,
         "itemid": itemid,
         "anum": anum,
         "ditemid": ditemid,
-        "url": ev.get("url") or f"{journal_base_url(user)}{ditemid}.html",
-        "poster": norm_user(ev.get("poster") or user),
-        "eventtime": ev.get("eventtime", ""),
-        "subject": ev.get("subject") or "",
-        "body": ev.get("event") or "",
+        "url": txt(ev.get("url")) or f"{journal_base_url(user)}{ditemid}.html",
+        "poster": norm_user(txt(ev.get("poster")) or user),
+        "eventtime": txt(ev.get("eventtime")),
+        "subject": txt(ev.get("subject")),
+        "body": txt(ev.get("event")),
         "body_format": "lj",
-        "security": ev.get("security") or "public",
+        "security": txt(ev.get("security")) or "public",
         "allowmask": int(ev.get("allowmask") or 0),
         "tags": tags,
         "mood": mood,
-        "music": props.get("current_music") or "",
-        "location": props.get("current_location") or "",
+        "music": txt(props.get("current_music")),
+        "location": txt(props.get("current_location")),
         "userpic_keyword": kw,
         "userpic_url": pics.get(kw) or pics.get("__default__") or "",
         "preformatted": bool(int(props.get("opt_preformatted") or 0)),
         "props": props,
         "reply_count": int(ev.get("reply_count") or props.get("replycount") or 0),
     }
+
+
+def _people(lst) -> list[dict]:
+    out = []
+    for f in lst or []:
+        f = dict(f)
+        for k in ("username", "fullname", "type"):
+            if k in f:
+                f[k] = txt(f[k])
+        out.append(f)
+    return out
 
 
 class OwnBackup:
@@ -72,6 +93,7 @@ class OwnBackup:
         self.j: Journal = archive.journal(self.user)
         self.log = log
         self.full = full
+        self.problem_entries: list[int] = []
 
     # ------------------------------------------------------------------
     def run(self, comments=True, connections=True):
@@ -84,34 +106,45 @@ class OwnBackup:
         return info
 
     def login(self) -> dict:
+        st = self.j.state
         saved = self.archive.load_session(self.user)
         if saved:
-            # reuse the session from a previous run: no password login at all
-            self.log(f"Connecting to the LiveJournal API as {self.user} (saved session)…")
             for k, v in saved.items():
-                self.http.set_cookie(k, v)
+                self.http.set_cookie(k, v)  # still good for comment export / web pages
+        if st.get("api_cookie_auth") is False:
+            # learned on an earlier run: LJ's API won't take session cookies,
+            # so don't spend (failed) login attempts finding that out again
+            self.log(f"Logging in to the LiveJournal API as {self.user}…")
+            if not saved:
+                self.api.new_session()
+                self.api.session = False
+        elif saved:
+            self.log(f"Connecting to the LiveJournal API as {self.user} (saved session)…")
             self.api.use_session()
         else:
-            # one password login makes a session; everything after uses it
             self.log(f"Logging in to the LiveJournal API as {self.user}…")
             self.api.new_session()
         info = self.api.login()
+        if self.api.cookie_auth_ok is not None and st.get("api_cookie_auth") != self.api.cookie_auth_ok:
+            st = self.j.state
+            st["api_cookie_auth"] = self.api.cookie_auth_ok
+            self.j.save_state(st)
         self.j.raw("login.json", json.dumps(info, ensure_ascii=False, indent=1))
         pics = {}
         for kw, url in zip(info.get("pickws") or [], info.get("pickwurls") or []):
-            pics[kw] = url
+            pics[txt(kw)] = txt(url)
         if info.get("defaultpicurl"):
-            pics["__default__"] = info["defaultpicurl"]
+            pics["__default__"] = txt(info["defaultpicurl"])
         self.j.put("userpics", pics)
-        self.moods = {str(m["id"]): m["name"] for m in info.get("moods") or []}
+        self.moods = {txt(m["id"]): txt(m["name"]) for m in info.get("moods") or []}
         self.pics = pics
         self.j.update_meta(
             username=self.user, source="api", userid=info.get("userid"),
-            fullname=info.get("fullname"), archived_at=int(time.time()),
+            fullname=txt(info.get("fullname")), archived_at=int(time.time()),
             url=journal_base_url(self.user),
         )
-        self.log(f"  connected ({self.api.password_logins} password login"
-                 f"{'' if self.api.password_logins == 1 else 's'} this run; session saved)")
+        how = "session" if self.api.session else "password logins (LJ's API doesn't take sessions)"
+        self.log(f"  connected via {how}")
         return info
 
     # ------------------------------------------------------------------
@@ -165,7 +198,14 @@ class OwnBackup:
             for ev in events:
                 iid = int(ev["itemid"])
                 self.j.raw(f"events/{iid}.json", json.dumps(ev, ensure_ascii=False, indent=1))
-                self.j.save_entry(normalize_api_entry(ev, self.user, self.moods, self.pics), force=True)
+                try:
+                    self.j.save_entry(normalize_api_entry(ev, self.user, self.moods, self.pics), force=True)
+                except Exception as e:  # noqa: BLE001 - one odd entry mustn't sink the run
+                    self.log(f"  entry {iid}: couldn't process ({type(e).__name__}: {e}); "
+                             "raw data kept, will retry next run")
+                    remaining.pop(iid, None)
+                    self.problem_entries.append(iid)
+                    continue
                 if iid in items:
                     known[str(iid)] = items[iid]
                     unsaved += 1
@@ -238,7 +278,18 @@ class OwnBackup:
         self.log("Exporting comments (export_comments.bml)…")
         st = self.j.state
         exp = CommentExporter(self.http)
-        meta, users, maxid = exp.meta(0, on_raw=lambda n, b: self.j.raw(f"comments/{n}", b))
+        raw = lambda n, b: self.j.raw(f"comments/{n}", b)  # noqa: E731
+        try:
+            meta, users, maxid = exp.meta(0, on_raw=raw)
+        except LJError as e:
+            if self.api.session_fresh:
+                raise
+            # the saved session may have expired: one new session, one retry
+            self.log(f"  ({e}; making a new session)")
+            self.api.new_session()
+            if self.api.cookie_auth_ok is False:
+                self.api.session = False  # the new cookie is for the export, not the API
+            meta, users, maxid = exp.meta(0, on_raw=raw)
         known_users = self.j.get("users", {}) or {}
         known_users.update(users)
         self.j.put("users", known_users)
@@ -372,13 +423,13 @@ class OwnBackup:
         self.j.raw("getfriends.json", json.dumps(fr, ensure_ascii=False, indent=1))
         self.j.put("friends", {
             "source": "api",
-            "friends": fr.get("friends") or [],
-            "friendof": fr.get("friendofs") or [],
-            "groups": fr.get("friendgroups") or [],
+            "friends": _people(fr.get("friends")),
+            "friendof": _people(fr.get("friendofs")),
+            "groups": [dict(g, name=txt(g.get("name"))) for g in fr.get("friendgroups") or []],
         })
         try:
             tags = self.api.call("getusertags", {})
-            self.j.put("tags", tags.get("tags") or [])
+            self.j.put("tags", [dict(t, name=txt(t.get("name"))) for t in tags.get("tags") or []])
         except LJError as e:
             self.log(f"  (tags unavailable: {e})")
         self.log(f"  {len(fr.get('friends') or [])} friends, {len(fr.get('friendofs') or [])} friend-of, "

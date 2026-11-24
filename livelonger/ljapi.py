@@ -81,6 +81,8 @@ class LJClient:
         self.password_provider = password_provider
         self.hpass = hpassword or (md5hex(password) if password else None)
         self.session = False
+        self.session_fresh = False   # made this run (vs. loaded from a previous run)
+        self.cookie_auth_ok = None   # learned: does the API accept session cookies?
         self.session_refreshes = 0
         self.password_logins = 0
         self.on_new_session = on_new_session  # callback(cookies dict)
@@ -128,6 +130,7 @@ class LJClient:
         """Authenticate later calls with the ljsession cookie (already in the
         HTTP client's cookie jar) instead of the password."""
         self.session = True
+        self.session_fresh = False
 
     def new_session(self) -> dict:
         """One password login -> a fresh session cookie, installed and in use."""
@@ -136,6 +139,7 @@ class LJClient:
         for k, v in cookies.items():
             self.http.set_cookie(k, v)
         self.session = True
+        self.session_fresh = True
         if self.on_new_session:
             self.on_new_session(cookies)
         return cookies
@@ -145,17 +149,25 @@ class LJClient:
         while self.session:
             p = dict(params, username=self.username, auth_method="cookie", ver=1)
             try:
-                return self._raw_call(method, p, headers={"X-LJ-Auth": "cookie"})
+                result = self._raw_call(method, p, headers={"X-LJ-Auth": "cookie"})
+                self.cookie_auth_ok = True
+                return result
             except LJError as e:
                 if e.code not in AUTH_FAULTS:
                     raise
-                if self.session_refreshes == 0:
+                # A session from an earlier run may simply have expired: replace
+                # it once. A session made moments ago being refused means the
+                # API doesn't take session cookies at all; don't keep trying,
+                # since each refusal probably counts as a failed login at LJ.
+                if not self.session_fresh and self.session_refreshes == 0:
                     self.session_refreshes += 1
-                    self.log("  (LJ didn't accept the session; making a new one)")
+                    self.log("  (saved session not accepted; making a new one)")
                     self.new_session()
                     continue
-                self.log("  (LJ doesn't accept session auth for the API; using password logins, sparingly)")
+                self.cookie_auth_ok = False
                 self.session = False
+                self.log("  (LJ's API doesn't accept session cookies; using password logins, "
+                         "spaced out; remembered for next time)")
         return self._password_call(method, params)
 
     def _password_call(self, method: str, params: dict) -> dict:

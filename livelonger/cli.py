@@ -44,14 +44,35 @@ def cmd_init(args, cfg):
     log(f"Wrote {p}. Next: `livelonger backup YOUR_LJ_USERNAME`")
 
 
+FAILED_STEPS: list[str] = []
+
+
 def _phase(name, fn, *a, **kw):
     """Run one stage of a backup. A failure in one stage is reported and the
-    next stage still runs; only a StopRun/Blocked ends the whole run."""
+    next stage still runs; only a StopRun/Blocked (or Ctrl-C) ends the run."""
+    import traceback
     from .ljapi import LJError
     try:
         return fn(*a, **kw)
     except (LJError, FetchError) as e:
+        FAILED_STEPS.append(name)
         log(f"  {name} failed: {e}\n  (continuing with the next step; re-run later to retry this one)")
+    except (Blocked, KeyboardInterrupt):
+        raise
+    except Exception as e:  # noqa: BLE001 - a bug in one step mustn't lose the others
+        FAILED_STEPS.append(name)
+        tb = traceback.extract_tb(e.__traceback__)[-1]
+        log(f"  {name} hit a bug: {type(e).__name__}: {e}\n"
+            f"  (at {Path(tb.filename).name}:{tb.lineno}; continuing with the next step. "
+            "Please report this.)")
+
+
+def _summary(http, extra=""):
+    http.close()
+    log(f"\nDone. {http.request_count} requests over {http.connection_count} connections{extra}.")
+    if FAILED_STEPS:
+        log(f"Steps that failed (re-run to retry): {', '.join(FAILED_STEPS)}")
+        sys.exit(1)
 
 
 def cmd_backup(args, cfg):
@@ -84,9 +105,10 @@ def cmd_backup(args, cfg):
     if not args.no_media:
         from .media import download_all
         _phase("media", download_all, archive, http, users=[user], log=log)
-    http.close()
-    log(f"\nDone. {http.request_count} requests over {http.connection_count} connections, "
-        f"{b.api.password_logins} password login(s). Build the site with `livelonger build`.")
+    if b.problem_entries:
+        log(f"  {len(b.problem_entries)} entries couldn't be processed: {b.problem_entries[:20]}")
+    _summary(http, f", {b.api.password_logins} password login(s). "
+                   "Build the site with `livelonger build`")
 
 
 def cmd_login(args, cfg):
@@ -133,8 +155,7 @@ def cmd_fetch(args, cfg):
     if not args.no_media:
         from .media import download_all
         _phase("media", download_all, archive, http, users=[norm_user(u) for u in args.users], log=log)
-    http.close()
-    log(f"\nDone. {http.request_count} requests over {http.connection_count} connections.")
+    _summary(http)
 
 
 def _theme(cfg, archive, http, user):

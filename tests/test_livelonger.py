@@ -148,8 +148,10 @@ class FakeHTTP:
         {"itemid": 1, "anum": 5, "eventtime": "2005-01-01 09:00:00", "subject": "First",
          "event": xmlrpc.client.Binary("Héllo\n<lj user=\"poeticdream\">".encode()),
          "security": "public", "props": {"taglist": "us, love", "current_moodid": 1}},
-        {"itemid": 2, "anum": 6, "eventtime": "2005-02-01 09:00:00", "subject": "Secret",
-         "event": "only us", "security": "usemask", "allowmask": 1, "props": {}},
+        {"itemid": 2, "anum": 6, "eventtime": "2005-02-01 09:00:00", "subject": 2008,
+         "event": "only us", "security": "usemask", "allowmask": 1,
+         # LJ's XML-RPC types numeric-looking values as ints (seen live: taglist 411)
+         "props": {"taglist": 411, "current_music": 1999, "picture_keyword": 42}},
     ]
 
     def getevents(self, params):
@@ -187,8 +189,9 @@ class FakeHTTP:
                             xmlrpc.client.dumps((res,), methodresponse=True).encode())
         res = {
             "getchallenge": {"challenge": "c0:1:2:3:abc"},
-            "login": {"userid": 7, "fullname": "Kim", "pickws": ["socks"],
-                      "pickwurls": ["https://l-userpic.livejournal.com/1/7"],
+            "login": {"userid": 7, "fullname": "Kim", "pickws": ["socks", 42],
+                      "pickwurls": ["https://l-userpic.livejournal.com/1/7",
+                                    "https://l-userpic.livejournal.com/2/7"],
                       "defaultpicurl": "https://l-userpic.livejournal.com/1/7",
                       "moods": [{"id": 1, "name": "amused"}]},
             "sessiongenerate": {"ljsession": "v1:u7:s9:aXYZ:g1//1"},
@@ -257,6 +260,9 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual([(c["id"], c["parent"], c["poster"]) for c in cs],
                              [(261, 0, "poeticdream"), (517, 261, "riffraff")])
             self.assertEqual(j.load_comments(518)[0]["state"], "S")
+            e2 = j.load_entry(518)
+            self.assertEqual((e2["subject"], e2["tags"], e2["music"]), ("2008", ["411"], "1999"))
+            self.assertEqual(e2["userpic_url"], "https://l-userpic.livejournal.com/2/7")
             self.assertIn("ljloggedin", http.cookies_set)
             self.assertEqual(http.cookies_set["ljloggedin"], "u7:s9")
             self.assertEqual(archive.load_session("riffraff")["ljsession"], "v1:u7:s9:aXYZ:g1//1")
@@ -384,6 +390,43 @@ class AuthAndOrderingTests(unittest.TestCase):
             b.connections()
         self.assertTrue(b.api.session)
         self.assertEqual(self.pw_logins(http), ["sessiongenerate"])
+
+    def test_cookie_auth_unsupported_is_learned_once(self):
+        http = FakeHTTP(cookie_auth=False)
+        b = self.backup(http)
+        b.login()
+        b.entries()
+        cookie_tries = [c for c in http.calls if c[1] == "cookie"]
+        self.assertEqual(len(cookie_tries), 1)               # one refusal settles it
+        self.assertEqual(self.pw_logins(http).count("sessiongenerate"), 1)  # no pointless refresh
+        self.assertIs(b.j.state["api_cookie_auth"], False)
+        # next run: no cookie attempts, no new session, straight to password calls
+        http2 = FakeHTTP(cookie_auth=False)
+        b2 = self.backup(http2)
+        b2.login()
+        b2.entries()
+        self.assertEqual([c for c in http2.calls if c[1] == "cookie"], [])
+        self.assertNotIn("sessiongenerate", self.pw_logins(http2))
+
+    def test_one_bad_entry_doesnt_sink_the_run(self):
+        http = FakeHTTP(n_events=5)
+        http.EVENTS[3] = dict(http.EVENTS[3], allowmask="not a number")   # itemid 4
+        b = self.backup(http)
+        b.login()
+        b.entries()
+        self.assertEqual(b.problem_entries, [4])
+        self.assertEqual(len(b.j.entry_ids()), 4)
+        self.assertNotIn("4", b.j.state["item_times"])       # retried next run
+        self.assertTrue(b.j.p("raw", "events", "4.json").exists())
+
+    def test_phase_survives_unexpected_bugs(self):
+        from livelonger import cli
+        from unittest import mock
+        cli.FAILED_STEPS.clear()
+        with mock.patch.object(cli, "log", lambda *a: None):
+            self.assertIsNone(cli._phase("demo", lambda: 1 / 0))
+        self.assertEqual(cli.FAILED_STEPS, ["demo"])
+        cli.FAILED_STEPS.clear()
 
     def test_empty_password_sends_nothing(self):
         from livelonger.ljapi import StopRun
