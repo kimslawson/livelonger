@@ -22,6 +22,7 @@ import http.cookiejar
 import json
 import random
 import socket
+import ssl
 import time
 import urllib.parse
 import urllib.request
@@ -86,6 +87,24 @@ def host_group(url: str) -> str:
     if host.endswith("livejournal.com") or host.endswith("livejournal.net"):
         return "livejournal"
     return host
+
+
+def describe_error(err: BaseException) -> str:
+    """A short human description of a connection failure."""
+    if isinstance(err, ssl.SSLCertVerificationError):
+        return f"certificate problem: {err.verify_message or err.reason}"
+    if isinstance(err, ssl.SSLError):
+        return f"TLS error: {err.reason or err}"
+    if isinstance(err, (TimeoutError, socket.timeout)):
+        return "timed out"
+    if isinstance(err, http.client.RemoteDisconnected):
+        return "connection closed by the server"
+    if isinstance(err, ConnectionRefusedError):
+        return "connection refused"
+    if isinstance(err, ConnectionResetError):
+        return "connection reset"
+    msg = str(err).strip()
+    return f"{type(err).__name__}: {msg}" if msg else type(err).__name__
 
 
 def _short(url: str) -> str:
@@ -284,17 +303,20 @@ class PoliteClient:
                 self.request_count += 1
 
             if err is not None:
-                reason = getattr(err, "reason", err)
-                # DNS failures for dead image hosts: don't bother retrying
-                if isinstance(err, socket.gaierror) or "nodename nor servname" in str(reason) \
-                        or "Name or service not known" in str(reason):
-                    raise FetchError(f"host not found: {reason}", url=url)
-                attempt += 1
                 host = urllib.parse.urlsplit(url).hostname
+                what = describe_error(err)
+                # dead domains and broken certificates won't fix themselves in
+                # a few seconds: fail now (media then gives up on the host)
+                if isinstance(err, socket.gaierror) or "nodename nor servname" in str(err) \
+                        or "Name or service not known" in str(err):
+                    raise FetchError(f"host not found: {host}", url=url)
+                if isinstance(err, ssl.SSLCertVerificationError):
+                    raise FetchError(f"{host}: {what}", url=url)
+                attempt += 1
                 if attempt > max_retries:
-                    raise FetchError(f"network error from {host} after {attempt} tries: {reason!r}", url=url)
+                    raise FetchError(f"network error from {host} after {attempt} tries: {what}", url=url)
                 wait = min(300, (2 ** attempt) * 2) + random.random()
-                self.log(f"  network error from {host} ({type(reason).__name__}); retrying in {wait:.0f}s")
+                self.log(f"  network error from {host} ({what}); retrying in {wait:.0f}s")
                 time.sleep(wait)
                 continue
 

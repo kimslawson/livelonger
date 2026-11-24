@@ -656,6 +656,19 @@ class HTTPTests(unittest.TestCase):
             self.assertEqual(len(list(Path(d).rglob("*.json"))), n)   # login page not cached
             c.close()
 
+    def test_error_descriptions(self):
+        import http.client
+        import ssl
+        from livelonger.http import describe_error
+        cert = ssl.SSLCertVerificationError(1, "x")
+        cert.verify_message, cert.reason = "certificate has expired", "CERTIFICATE_VERIFY_FAILED"
+        self.assertEqual(describe_error(cert), "certificate problem: certificate has expired")
+        tls = ssl.SSLError(1, "x")
+        tls.reason = "TLSV1_ALERT_PROTOCOL_VERSION"
+        self.assertEqual(describe_error(tls), "TLS error: TLSV1_ALERT_PROTOCOL_VERSION")
+        self.assertEqual(describe_error(TimeoutError()), "timed out")
+        self.assertEqual(describe_error(http.client.RemoteDisconnected("x")), "connection closed by the server")
+
     def test_cache_is_per_login(self):
         with tempfile.TemporaryDirectory() as d:
             c = self.client(Path(d))
